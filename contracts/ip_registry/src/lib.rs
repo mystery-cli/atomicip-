@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    Error, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Bytes, BytesN, Env, Error, Vec,
 };
 
 mod validation;
@@ -85,6 +85,7 @@ pub enum DataKey {
     IpAccessGrants(u64),    // Issue #344: stores Vec of (grantee, access_level) for tiered access
     NotarySignature(u64),   // Issue #345: stores notary signature for timestamp notarization
     IpVersionChain(u64),    // stores Vec<u64> of the full version chain rooted at a given IP
+    AnonymousCommitments(BytesN<32>), // maps reveal_token -> AnonymousCommitment record
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -1512,6 +1513,177 @@ impl IpRegistry {
         let recomputed_checksum: BytesN<32> = env.crypto().sha256(&all_hashes).into();
 
         stored_checksum.unwrap() == recomputed_checksum
+    }
+
+    /// Commit an IP anonymously — no owner address is stored on-chain.
+    ///
+    /// The caller supplies a `commitment_hash` (the Pedersen hash of their IP)
+    /// and a `reveal_token` (a secret 32-byte value they generate off-chain).
+    /// Only the `reveal_token` is used as the storage key; no address is
+    /// recorded, so on-chain observers cannot link the commitment to an identity.
+    ///
+    /// The caller must keep the `reveal_token` secret. Anyone who knows it can
+    /// call `claim_anonymous_ip` to assign ownership.
+    ///
+    /// # Privacy guarantees
+    /// - No address is stored at commit time.
+    /// - The `reveal_token` is the only link between the commitment and its
+    ///   future owner; it is never stored in plaintext alongside an address.
+    ///
+    /// # Limitations
+    /// - Network-level metadata (transaction sender, fee account) may still
+    ///   reveal the submitter to a network observer. Use a privacy relay or
+    ///   fee-sponsorship to mitigate this.
+    /// - The `reveal_token` must be kept secret; loss means the commitment
+    ///   can never be claimed.
+    ///
+    /// # Returns
+    /// The `reveal_token` echoed back for convenience.
+    pub fn commit_ip_anonymous(
+        env: Env,
+        commitment_hash: BytesN<32>,
+        reveal_token: BytesN<32>,
+    ) -> BytesN<32> {
+        require_non_zero_commitment(&env, &commitment_hash);
+        require_unique_commitment(&env, &commitment_hash);
+
+        // Ensure the reveal_token is not already in use.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::AnonymousCommitments(reveal_token.clone()))
+        {
+            panic_with_error!(&env, ContractError::CommitmentAlreadyRegistered);
+        }
+
+        let record = AnonymousCommitment {
+            commitment_hash: commitment_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+            claimed: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AnonymousCommitments(reveal_token.clone()), &record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AnonymousCommitments(reveal_token.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Mark the commitment hash as "taken" (value is a sentinel contract address)
+        // so duplicate-commitment checks work across both anonymous and named paths.
+        let sentinel = env.current_contract_address();
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &sentinel);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("anon_cmt"),),
+            record.timestamp,
+        );
+
+        reveal_token
+    }
+
+    /// Claim an anonymous commitment by presenting the reveal token.
+    ///
+    /// Converts the anonymous commitment into a full `IpRecord` owned by
+    /// `owner`. The `owner` must authorize this transaction so that only the
+    /// holder of the private key for `owner` can claim the IP.
+    ///
+    /// # Panics
+    /// - `IpNotFound` if the `reveal_token` does not match any anonymous commitment.
+    /// - `CommitmentAlreadyRegistered` if the commitment has already been claimed.
+    ///
+    /// # Returns
+    /// The new IP ID assigned to the claimed commitment.
+    pub fn claim_anonymous_ip(env: Env, reveal_token: BytesN<32>, owner: Address) -> u64 {
+        owner.require_auth();
+
+        let key = DataKey::AnonymousCommitments(reveal_token.clone());
+        let mut anon: AnonymousCommitment = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::IpNotFound));
+
+        if anon.claimed {
+            panic_with_error!(&env, ContractError::CommitmentAlreadyRegistered);
+        }
+
+        // Assign the next IP ID.
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let record = IpRecord {
+            ip_id: id,
+            owner: owner.clone(),
+            commitment_hash: anon.commitment_hash.clone(),
+            timestamp: anon.timestamp, // preserve original anonymous timestamp
+            revoked: false,
+            co_owners: Vec::new(&env),
+            parent_ip_id: None,
+            notary_signature: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Append to owner index.
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(owner.clone()), &ids);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnerIps(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Update commitment → owner mapping to the real owner now that it's claimed.
+        env.storage().persistent().set(
+            &DataKey::CommitmentOwner(anon.commitment_hash.clone()),
+            &owner,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(anon.commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Mark the anonymous record as claimed.
+        anon.claimed = true;
+        env.storage().persistent().set(&key, &anon);
+
+        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("anon_clm"), owner.clone()),
+            (id, anon.timestamp),
+        );
+
+        id
     }
 }
 

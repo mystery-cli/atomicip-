@@ -19,6 +19,9 @@
                 },
                 {
                   "bytes": "0808080808080808080808080808080808080808080808080808080808080808"
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -149,6 +152,45 @@
             "key": {
               "vec": [
                 {
+                  "symbol": "IpCommitmentChecksum"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "IpCommitmentChecksum"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          6307200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
                   "symbol": "IpRecord"
                 },
                 {
@@ -181,6 +223,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "co_owners"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "commitment_hash"
                       },
                       "val": {
@@ -197,11 +247,23 @@
                     },
                     {
                       "key": {
+                        "symbol": "notary_signature"
+                      },
+                      "val": "void"
+                    },
+                    {
+                      "key": {
                         "symbol": "owner"
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "parent_ip_id"
+                      },
+                      "val": "void"
                     },
                     {
                       "key": {

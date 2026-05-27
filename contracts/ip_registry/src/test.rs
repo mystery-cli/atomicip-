@@ -46,6 +46,8 @@ mod tests {
         fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: soroban_sdk::Bytes);
         fn get_ip_disputes(env: Env, ip_id: u64) -> Vec<crate::IpChallenge>;
         fn commit_ip_version(env: Env, owner: Address, commitment_hash: BytesN<32>, parent_ip_id: u64) -> u64;
+        fn commit_ip_anonymous(env: Env, commitment_hash: BytesN<32>, reveal_token: BytesN<32>) -> BytesN<32>;
+        fn claim_anonymous_ip(env: Env, reveal_token: BytesN<32>, owner: Address) -> u64;
     }
 
     #[test]
@@ -1057,5 +1059,131 @@ mod tests {
             &challenger,
             &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]),
         );
+    }
+
+    // ── Anonymous Commitment Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_commit_ip_anonymous_returns_reveal_token() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let commitment_hash = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let reveal_token = BytesN::from_array(&env, &[0xBBu8; 32]);
+
+        let returned = client.commit_ip_anonymous(&commitment_hash, &reveal_token);
+        assert_eq!(returned, reveal_token);
+    }
+
+    #[test]
+    fn test_claim_anonymous_ip_creates_ip_record() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let commitment_hash = BytesN::from_array(&env, &[0xCCu8; 32]);
+        let reveal_token = BytesN::from_array(&env, &[0xDDu8; 32]);
+        let owner = <Address as TestAddress>::generate(&env);
+
+        client.commit_ip_anonymous(&commitment_hash, &reveal_token);
+
+        env.mock_all_auths();
+        let ip_id = client.claim_anonymous_ip(&reveal_token, &owner);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.commitment_hash, commitment_hash);
+    }
+
+    #[test]
+    fn test_claim_anonymous_ip_preserves_original_timestamp() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let commitment_hash = BytesN::from_array(&env, &[0xEEu8; 32]);
+        let reveal_token = BytesN::from_array(&env, &[0xFFu8; 32]);
+        let owner = <Address as TestAddress>::generate(&env);
+
+        let commit_time = env.ledger().timestamp();
+        client.commit_ip_anonymous(&commitment_hash, &reveal_token);
+
+        env.mock_all_auths();
+        let ip_id = client.claim_anonymous_ip(&reveal_token, &owner);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.timestamp, commit_time, "claimed IP must preserve the anonymous commit timestamp");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_claim_anonymous_ip_twice_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let commitment_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+        let reveal_token = BytesN::from_array(&env, &[0x22u8; 32]);
+        let owner = <Address as TestAddress>::generate(&env);
+
+        client.commit_ip_anonymous(&commitment_hash, &reveal_token);
+
+        env.mock_all_auths();
+        client.claim_anonymous_ip(&reveal_token, &owner);
+        // Second claim must panic (CommitmentAlreadyRegistered)
+        client.claim_anonymous_ip(&reveal_token, &owner);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_claim_anonymous_ip_wrong_token_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let commitment_hash = BytesN::from_array(&env, &[0x33u8; 32]);
+        let reveal_token = BytesN::from_array(&env, &[0x44u8; 32]);
+        let wrong_token = BytesN::from_array(&env, &[0x55u8; 32]);
+        let owner = <Address as TestAddress>::generate(&env);
+
+        client.commit_ip_anonymous(&commitment_hash, &reveal_token);
+
+        env.mock_all_auths();
+        // Wrong token — must panic (IpNotFound)
+        client.claim_anonymous_ip(&wrong_token, &owner);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_commit_ip_anonymous_duplicate_commitment_hash_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let commitment_hash = BytesN::from_array(&env, &[0x66u8; 32]);
+        let token1 = BytesN::from_array(&env, &[0x77u8; 32]);
+        let token2 = BytesN::from_array(&env, &[0x88u8; 32]);
+
+        client.commit_ip_anonymous(&commitment_hash, &token1);
+        // Same commitment_hash with different token — must panic (CommitmentAlreadyRegistered)
+        client.commit_ip_anonymous(&commitment_hash, &token2);
+    }
+
+    #[test]
+    fn test_anonymous_commitment_not_linked_to_owner_before_claim() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let commitment_hash = BytesN::from_array(&env, &[0x99u8; 32]);
+        let reveal_token = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let owner = <Address as TestAddress>::generate(&env);
+
+        client.commit_ip_anonymous(&commitment_hash, &reveal_token);
+
+        // Owner has no IPs before claiming
+        let owner_ips = client.list_ip_by_owner(&owner);
+        assert_eq!(owner_ips.len(), 0, "owner must have no IPs before claiming");
     }
 }
