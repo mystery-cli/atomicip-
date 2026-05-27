@@ -2292,6 +2292,81 @@ impl IpRegistry {
 /// # Panics
 ///
 /// Panics with `IpAlreadyRevoked` (reused semantics) if the IP is not revoked.
+    // ── Issue: Periodic Snapshots for Disaster Recovery ────────────────────────────────────────
+
+    /// Create a snapshot of the current commitment registry state.
+    ///
+    /// Records the total number of committed IPs and a checksum of the next
+    /// available ID as a lightweight state fingerprint. Admin-only.
+    /// Returns the new snapshot_id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin.
+    pub fn create_snapshot(env: Env, caller: Address) -> u64 {
+        caller.require_auth();
+        let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        if admin.map_or(true, |a| a != caller) {
+            env.panic_with_error(soroban_sdk::Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        let next_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let checksum: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_array(&env, &next_id.to_be_bytes()))
+            .into();
+
+        let snapshot_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextSnapshotId)
+            .unwrap_or(1);
+
+        let snapshot = CommitmentSnapshot {
+            snapshot_id,
+            timestamp: env.ledger().timestamp(),
+            total_count: next_id.saturating_sub(1),
+            checksum,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Snapshot(snapshot_id), &snapshot);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Snapshot(snapshot_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextSnapshotId, &(snapshot_id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextSnapshotId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("snapshot"), caller),
+            (snapshot_id, env.ledger().timestamp()),
+        );
+
+        snapshot_id
+    }
+
+    /// Retrieve a previously created snapshot by ID.
+    ///
+    /// Returns `None` if no snapshot with that ID exists.
+    pub fn get_snapshot(env: Env, snapshot_id: u64) -> Option<CommitmentSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id))
+    }
+
 fn require_is_revoked(env: &Env, record: &IpRecord) {
     if !record.revoked {
         env.panic_with_error(soroban_sdk::Error::from_contract_error(

@@ -61,6 +61,8 @@ mod tests {
         fn compute_ip_merkle_root(env: Env, owner: Address) -> BytesN<32>;
         fn verify_ip_merkle_proof(env: Env, ip_id: u64, proof: Vec<BytesN<32>>) -> bool;
         fn cleanup_revoked_commitment(env: Env, ip_id: u64);
+        fn create_snapshot(env: Env, caller: Address) -> u64;
+        fn get_snapshot(env: Env, snapshot_id: u64) -> Option<crate::CommitmentSnapshot>;
         fn initiate_dispute(env: Env, ip_id: u64, challenger: Address, evidence_hash: BytesN<32>) -> u64;
         fn submit_dispute_evidence(env: Env, dispute_id: u64, submitter: Address, evidence_hash: BytesN<32>);
         fn resolve_dispute(env: Env, dispute_id: u64, winner: Address);
@@ -1583,6 +1585,49 @@ mod tests {
 
         // Not revoked — must panic
         client.cleanup_revoked_commitment(&ip_id);
+    }
+
+    // ── Issue: Periodic Snapshots for Disaster Recovery ────────────────────────────────────────
+
+    #[test]
+    fn test_create_and_get_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0xD1u8; 32]), &0u32);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0xD2u8; 32]), &0u32);
+
+        let snap_id = client.create_snapshot(&owner);
+        assert_eq!(snap_id, 1u64);
+
+        let snap = client.get_snapshot(&snap_id).unwrap();
+        assert_eq!(snap.snapshot_id, 1u64);
+        assert_eq!(snap.total_count, 2u64);
+    }
+
+    #[test]
+    fn test_snapshot_ids_are_sequential() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let s1 = client.create_snapshot(&owner);
+        let s2 = client.create_snapshot(&owner);
+        assert_eq!(s1, 1u64);
+        assert_eq!(s2, 2u64);
+    }
+
+    #[test]
+    fn test_get_snapshot_nonexistent_returns_none() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        assert!(client.get_snapshot(&999u64).is_none());
     }
 
 }
