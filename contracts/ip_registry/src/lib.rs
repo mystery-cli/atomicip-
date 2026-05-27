@@ -1606,13 +1606,23 @@ impl IpRegistry {
 
     // ── Issue #344: Tiered Access Control ──────────────────────────────────────
 
-    /// Grant access to an IP for a third party. Owner-only.
-    /// access_level: 0 = none, 1 = read-only, 2 = read-write
+    /// Grant tiered access to an IP for a third party. Owner-only.
+    ///
+    /// Access tiers are hierarchical — a higher tier implies all lower tiers:
+    /// - `1` = **view**: read IP metadata
+    /// - `2` = **verify**: view + verify the commitment
+    /// - `3` = **transfer**: view + verify + initiate transfer
+    ///
+    /// Granting to an address that already has a grant updates the level.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if `access_level` is 0 or > 3, or if caller is not the owner.
     pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
-        if access_level > 2 {
+        if access_level < 1 || access_level > 3 {
             env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
         }
 
@@ -1631,7 +1641,7 @@ impl IpRegistry {
             }
         }
         if !found {
-            grants.push_back(IpAccessGrant { grantee, access_level });
+            grants.push_back(IpAccessGrant { grantee: grantee.clone(), access_level });
         }
 
         env.storage()
@@ -1642,9 +1652,15 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        env.events().publish(
+            (symbol_short!("ac_grant"), ip_id),
+            (grantee, access_level),
+        );
     }
 
     /// Revoke access to an IP from a third party. Owner-only.
+    /// No-op if the grantee has no grant.
     pub fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
@@ -1665,6 +1681,11 @@ impl IpRegistry {
                 LEDGER_BUMP,
                 LEDGER_BUMP,
             );
+
+            env.events().publish(
+                (symbol_short!("ac_revoke"), ip_id),
+                grantee,
+            );
         }
     }
 
@@ -1675,6 +1696,31 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpAccessGrants(ip_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Check whether `grantee` has at least `required_level` access to `ip_id`.
+    ///
+    /// The owner always has full access (level 3). Tiers are hierarchical:
+    /// a grantee with level 3 satisfies a check for level 1 or 2.
+    ///
+    /// Returns `true` if access is granted, `false` otherwise.
+    pub fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+        // Owner always has full access
+        if grantee == record.owner {
+            return true;
+        }
+        let grants: Vec<IpAccessGrant> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpAccessGrants(ip_id))
+            .unwrap_or(Vec::new(&env));
+        for grant in grants.iter() {
+            if grant.grantee == grantee {
+                return grant.access_level >= required_level;
+            }
+        }
+        false
     }
 
     // ── Issue #345 / #428: Timestamp Notarization ──────────────────────────────

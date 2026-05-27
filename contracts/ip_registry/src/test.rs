@@ -68,6 +68,10 @@ mod tests {
         fn get_ip_lineage(env: Env, ip_id: u64) -> Vec<u64>;
         fn get_ip_version_chain(env: Env, ip_id: u64) -> Vec<u64>;
         fn check_expiration_warning(env: Env, ip_id: u64, warning_threshold_ledgers: u32) -> bool;
+        fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32);
+        fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address);
+        fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<crate::IpAccessGrant>;
+        fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool;
     }
 
     #[test]
@@ -1873,5 +1877,216 @@ mod tests {
         let event = events.get(0).unwrap();
         let expected_topics = (symbol_short!("exp_warn"), ip_id).into_val(&env);
         assert_eq!(event.1, expected_topics);
+    }
+
+    // ── Tests for Tiered Access Control ───────────────────────────────────────
+
+    fn setup_ip(env: &Env, client: &IpRegistryClient, seed: u8) -> (Address, u64) {
+        let owner = <Address as TestAddress>::generate(env);
+        let hash = BytesN::from_array(env, &[seed; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        (owner, ip_id)
+    }
+
+    #[test]
+    fn test_grant_view_access_and_check() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 10);
+        let grantee = <Address as TestAddress>::generate(&env);
+
+        client.grant_ip_access(&ip_id, &grantee, &1u32);
+
+        assert!(client.check_ip_access(&ip_id, &grantee, &1u32), "view access granted");
+        assert!(!client.check_ip_access(&ip_id, &grantee, &2u32), "verify not granted");
+        assert!(!client.check_ip_access(&ip_id, &grantee, &3u32), "transfer not granted");
+    }
+
+    #[test]
+    fn test_grant_verify_access_implies_view() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 11);
+        let grantee = <Address as TestAddress>::generate(&env);
+
+        client.grant_ip_access(&ip_id, &grantee, &2u32);
+
+        assert!(client.check_ip_access(&ip_id, &grantee, &1u32), "verify implies view");
+        assert!(client.check_ip_access(&ip_id, &grantee, &2u32), "verify access granted");
+        assert!(!client.check_ip_access(&ip_id, &grantee, &3u32), "transfer not granted");
+    }
+
+    #[test]
+    fn test_grant_transfer_access_implies_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 12);
+        let grantee = <Address as TestAddress>::generate(&env);
+
+        client.grant_ip_access(&ip_id, &grantee, &3u32);
+
+        assert!(client.check_ip_access(&ip_id, &grantee, &1u32));
+        assert!(client.check_ip_access(&ip_id, &grantee, &2u32));
+        assert!(client.check_ip_access(&ip_id, &grantee, &3u32));
+    }
+
+    #[test]
+    fn test_owner_always_has_full_access() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (owner, ip_id) = setup_ip(&env, &client, 13);
+
+        assert!(client.check_ip_access(&ip_id, &owner, &1u32));
+        assert!(client.check_ip_access(&ip_id, &owner, &2u32));
+        assert!(client.check_ip_access(&ip_id, &owner, &3u32));
+    }
+
+    #[test]
+    fn test_ungranteed_address_has_no_access() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 14);
+        let stranger = <Address as TestAddress>::generate(&env);
+
+        assert!(!client.check_ip_access(&ip_id, &stranger, &1u32));
+    }
+
+    #[test]
+    fn test_revoke_removes_access() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 15);
+        let grantee = <Address as TestAddress>::generate(&env);
+
+        client.grant_ip_access(&ip_id, &grantee, &2u32);
+        assert!(client.check_ip_access(&ip_id, &grantee, &2u32));
+
+        client.revoke_ip_access(&ip_id, &grantee);
+        assert!(!client.check_ip_access(&ip_id, &grantee, &1u32), "access removed after revoke");
+    }
+
+    #[test]
+    fn test_upgrade_grant_level() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 16);
+        let grantee = <Address as TestAddress>::generate(&env);
+
+        client.grant_ip_access(&ip_id, &grantee, &1u32);
+        client.grant_ip_access(&ip_id, &grantee, &3u32); // upgrade
+
+        let grants = client.get_ip_access_grants(&ip_id);
+        assert_eq!(grants.len(), 1, "only one grant entry per grantee");
+        assert_eq!(grants.get(0).unwrap().access_level, 3u32);
+    }
+
+    #[test]
+    fn test_multiple_grantees() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 17);
+        let viewer = <Address as TestAddress>::generate(&env);
+        let verifier = <Address as TestAddress>::generate(&env);
+        let transferrer = <Address as TestAddress>::generate(&env);
+
+        client.grant_ip_access(&ip_id, &viewer, &1u32);
+        client.grant_ip_access(&ip_id, &verifier, &2u32);
+        client.grant_ip_access(&ip_id, &transferrer, &3u32);
+
+        let grants = client.get_ip_access_grants(&ip_id);
+        assert_eq!(grants.len(), 3);
+        assert!(client.check_ip_access(&ip_id, &viewer, &1u32));
+        assert!(!client.check_ip_access(&ip_id, &viewer, &2u32));
+        assert!(client.check_ip_access(&ip_id, &verifier, &2u32));
+        assert!(client.check_ip_access(&ip_id, &transferrer, &3u32));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_grant_invalid_level_zero_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 18);
+        let grantee = <Address as TestAddress>::generate(&env);
+        client.grant_ip_access(&ip_id, &grantee, &0u32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_grant_invalid_level_four_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 19);
+        let grantee = <Address as TestAddress>::generate(&env);
+        client.grant_ip_access(&ip_id, &grantee, &4u32);
+    }
+
+    #[test]
+    fn test_revoke_nonexistent_grant_is_noop() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 20);
+        let stranger = <Address as TestAddress>::generate(&env);
+        // Should not panic
+        client.revoke_ip_access(&ip_id, &stranger);
+    }
+
+    #[test]
+    fn test_grant_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 21);
+        let grantee = <Address as TestAddress>::generate(&env);
+
+        let _ = env.events().all();
+        client.grant_ip_access(&ip_id, &grantee, &2u32);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        let expected_topics = (symbol_short!("ac_grant"), ip_id).into_val(&env);
+        assert_eq!(last.1, expected_topics);
+    }
+
+    #[test]
+    fn test_revoke_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let (_, ip_id) = setup_ip(&env, &client, 22);
+        let grantee = <Address as TestAddress>::generate(&env);
+
+        client.grant_ip_access(&ip_id, &grantee, &1u32);
+        let _ = env.events().all();
+        client.revoke_ip_access(&ip_id, &grantee);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        let expected_topics = (symbol_short!("ac_revoke"), ip_id).into_val(&env);
+        assert_eq!(last.1, expected_topics);
     }
 }

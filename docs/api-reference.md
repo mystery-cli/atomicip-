@@ -510,3 +510,90 @@ See [TTL_MANAGEMENT.md](../TTL_MANAGEMENT.md) for details.
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid commitment hashes
 - [Atomic Swap Flow](atomic-swap.md) — How to sell IP using atomic swaps
 - [Security Considerations](security.md) — Best practices for secret management
+
+---
+
+## Tiered Access Control
+
+IP owners can grant other addresses tiered read/verify/transfer access without transferring ownership.
+
+### Access Tiers
+
+| Level | Name | Permissions |
+|---|---|---|
+| `1` | **view** | Read IP metadata |
+| `2` | **verify** | View + verify the commitment |
+| `3` | **transfer** | View + verify + initiate transfer |
+
+Tiers are hierarchical: a grantee with level 3 satisfies checks for levels 1 and 2. The owner always has full access (level 3) regardless of grants.
+
+---
+
+### `grant_ip_access`
+
+Grant tiered access to an IP for a third party. Owner-only. Granting to an address that already has a grant updates the level.
+
+```rust
+pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP to grant access to |
+| `grantee` | `Address` | The address receiving access |
+| `access_level` | `u32` | `1` = view, `2` = verify, `3` = transfer |
+
+**Panics:** `Unauthorized` (6) if `access_level` is 0 or > 3, or caller is not the owner.
+
+**Event:** `(symbol_short!("ac_grant"), ip_id)` → `(grantee, access_level)`
+
+```rust
+// Grant verify access to a partner
+registry.grant_ip_access(&ip_id, &partner, &2u32);
+```
+
+---
+
+### `revoke_ip_access`
+
+Revoke access from a grantee. Owner-only. No-op if the grantee has no grant.
+
+```rust
+pub fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address)
+```
+
+**Event:** `(symbol_short!("ac_revoke"), ip_id)` → `grantee`
+
+```rust
+registry.revoke_ip_access(&ip_id, &partner);
+```
+
+---
+
+### `check_ip_access`
+
+Check whether an address has at least the required access level for an IP.
+
+```rust
+pub fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool
+```
+
+Returns `true` if the grantee's level ≥ `required_level`, or if `grantee` is the owner.
+
+```rust
+if registry.check_ip_access(&ip_id, &caller, &2u32) {
+    // caller can verify the commitment
+}
+```
+
+---
+
+### `get_ip_access_grants`
+
+Return all active access grants for an IP.
+
+```rust
+pub fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<IpAccessGrant>
+```
+
+Returns a `Vec<IpAccessGrant>` where each entry has `grantee: Address` and `access_level: u32`.
