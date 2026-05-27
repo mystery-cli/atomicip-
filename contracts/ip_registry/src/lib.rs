@@ -101,6 +101,7 @@ pub enum DataKey {
     EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
     NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
+    IpPowDifficulty(u64),   // stores the pow_difficulty used at commit time for strength scoring
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -292,6 +293,16 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Store pow_difficulty for strength scoring (Issue: entropy/complexity scoring)
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpPowDifficulty(id), &pow_difficulty);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpPowDifficulty(id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
 
         // Append to owner index
         let mut ids: Vec<u64> = env
@@ -757,6 +768,50 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::PowDifficulty)
             .unwrap_or(4u32)
+    }
+
+    /// Returns the entropy-and-complexity strength score (0–100) for an IP commitment.
+    ///
+    /// The score combines:
+    /// - **Byte entropy**: number of unique bytes in the 32-byte commitment hash,
+    ///   scaled to 0–50 (max 32 unique bytes → 50 points).
+    /// - **PoW difficulty**: the `pow_difficulty` used at commit time, scaled to 0–50
+    ///   (each difficulty bit contributes ~1.5625 points, capped at 50).
+    ///
+    /// Weak commitments (e.g. all-same-byte hashes or zero PoW) score low; strong,
+    /// high-entropy commitments with meaningful PoW score near 100.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `IpNotFound` if the IP does not exist.
+    pub fn get_ip_strength(env: Env, ip_id: u64) -> u32 {
+        let record = require_ip_exists(&env, ip_id);
+        let pow_difficulty: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpPowDifficulty(ip_id))
+            .unwrap_or(0u32);
+
+        let hash_bytes = record.commitment_hash.to_array();
+
+        // Count unique bytes as a proxy for byte-level entropy (0–32 unique values)
+        let mut seen = [false; 256];
+        for b in hash_bytes.iter() {
+            seen[*b as usize] = true;
+        }
+        let unique_bytes = seen.iter().filter(|&&v| v).count() as u32;
+
+        // Scale unique_bytes (0–32) to 0–50
+        let entropy_score = (unique_bytes * 50) / 32;
+
+        // Scale pow_difficulty to 0–50 (32 bits max → 50 points)
+        let pow_score = if pow_difficulty >= 32 {
+            50u32
+        } else {
+            (pow_difficulty * 50) / 32
+        };
+
+        (entropy_score + pow_score).min(100)
     }
 
     /// Returns the current protocol configuration.

@@ -171,7 +171,42 @@ fn verify_commitment(
 }
 ```
 
-## Security Considerations
+## Commitment Strength Scoring
+
+Every IP commitment is assigned a **strength score** (0–100) that reflects the entropy and complexity of the commitment hash. Weak commitments (e.g. all-same-byte hashes or zero PoW) score low; strong, high-entropy commitments with meaningful PoW score near 100.
+
+### Scoring Formula
+
+```
+entropy_score = (unique_bytes_in_hash * 50) / 32   // 0–50 points
+pow_score     = min(50, (pow_difficulty * 50) / 32) // 0–50 points
+strength      = min(100, entropy_score + pow_score)
+```
+
+| Component | Max Points | Description |
+|-----------|-----------|-------------|
+| Byte entropy | 50 | Number of unique byte values in the 32-byte commitment hash, scaled to 0–50 |
+| PoW difficulty | 50 | Leading-zero-bit difficulty used at commit time, scaled to 0–50 (32 bits = 50 pts) |
+
+### Querying Strength
+
+```rust
+let strength: u32 = registry.get_ip_strength(&ip_id);
+// Returns 0–100
+```
+
+### Practical Guidance
+
+- A SHA-256 hash of real content will have ~30–32 unique bytes → ~47–50 entropy points.
+- Using `pow_difficulty = 4` (default) adds ~6 points.
+- A typical real-world commitment scores **53–56 / 100**.
+- To reach 100, use a high-entropy hash (32 unique bytes) with `pow_difficulty ≥ 32`.
+
+### Why Entropy Matters
+
+A commitment hash derived from a real design document (via SHA-256) will have high byte entropy — the 256 possible byte values are roughly uniformly distributed. A weak hash like `[0x01; 32]` (all same byte) signals the commitment may not represent genuine IP, and scores near zero.
+
+
 
 ### Why Use a Blinding Factor?
 

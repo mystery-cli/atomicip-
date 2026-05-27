@@ -830,41 +830,90 @@ mod tests {
     // ── Tests for Issue #335: IP Commitment Strength Scoring ──────────────────
 
     #[test]
-    #[ignore]
-    fn test_get_ip_strength() {
+    fn test_get_ip_strength_low_entropy_low_pow() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        // All-same-byte hash: 1 unique byte → entropy_score = (1*50)/32 = 1
+        // pow_difficulty = 0 → pow_score = 0
+        // total = 1
         let hash = BytesN::from_array(&env, &[1u8; 32]);
-
-        let ip_id = client.commit_ip(&owner, &hash, &4u32);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
         let strength = client.get_ip_strength(&ip_id);
-
-        // Strength should be calculated based on secret length (32) and PoW difficulty (4)
-        // Formula: min(100, (32 * 2) + (4 * 3)) = min(100, 64 + 12) = 76
-        assert_eq!(strength, 76u32);
+        assert_eq!(strength, 1u32);
     }
 
     #[test]
-    #[ignore]
-    #[ignore]
-    fn test_get_ip_strength_max_capped_at_100() {
+    fn test_get_ip_strength_high_entropy() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[1u8; 32]);
-
-        let ip_id = client.commit_ip(&owner, &hash, &20u32);
+        // 32 unique bytes → entropy_score = (32*50)/32 = 50
+        // pow_difficulty = 0 → pow_score = 0
+        // total = 50
+        let hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let hash = BytesN::from_array(&env, &hash_bytes);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
         let strength = client.get_ip_strength(&ip_id);
+        assert_eq!(strength, 50u32);
+    }
 
-        // Strength should be capped at 100
+    #[test]
+    fn test_get_ip_strength_max_pow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        // 32 unique bytes → entropy_score = 50
+        // pow_difficulty = 32 → pow_score = 50
+        // total = 100
+        let hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let hash = BytesN::from_array(&env, &hash_bytes);
+        let ip_id = client.commit_ip(&owner, &hash, &32u32);
+        let strength = client.get_ip_strength(&ip_id);
         assert_eq!(strength, 100u32);
+    }
+
+    #[test]
+    fn test_get_ip_strength_capped_at_100() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        // 32 unique bytes (50) + pow_difficulty=64 → pow_score capped at 50 → total = 100
+        let hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let hash = BytesN::from_array(&env, &hash_bytes);
+        let ip_id = client.commit_ip(&owner, &hash, &64u32);
+        let strength = client.get_ip_strength(&ip_id);
+        assert_eq!(strength, 100u32);
+    }
+
+    #[test]
+    fn test_get_ip_strength_partial_entropy_and_pow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        // 16 unique bytes → entropy_score = (16*50)/32 = 25
+        // pow_difficulty = 16 → pow_score = (16*50)/32 = 25
+        // total = 50
+        let hash_bytes: [u8; 32] = core::array::from_fn(|i| (i % 16) as u8);
+        let hash = BytesN::from_array(&env, &hash_bytes);
+        let ip_id = client.commit_ip(&owner, &hash, &16u32);
+        let strength = client.get_ip_strength(&ip_id);
+        assert_eq!(strength, 50u32);
     }
 
     // ── Tests for Issue #338: IP Commitment Delegation ────────────────────────
