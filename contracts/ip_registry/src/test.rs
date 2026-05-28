@@ -37,7 +37,9 @@ mod tests {
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
         fn get_pow_difficulty(env: Env) -> u32;
         fn get_ip_strength(env: Env, ip_id: u64) -> u32;
-        fn delegate_commitment_authority(env: Env, owner: Address, delegate_address: Address);
+        fn renew_ip(env: Env, ip_id: u64);
+        fn get_renewal_count(env: Env, ip_id: u64) -> u32;
+        fn delegate_commitment_authority(env: Env, root_owner: Address, delegator: Address, delegate_address: Address);
         fn revoke_delegation(env: Env, owner: Address, delegate_address: Address);
         fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool;
         fn commit_ip_delegated(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;

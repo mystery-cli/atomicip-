@@ -108,6 +108,18 @@ pub enum DataKey {
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+/// Delegation chain record: tracks a delegate and the depth at which they were granted authority.
+/// Depth 0 = direct delegate of the owner; depth 1 = delegate of a delegate, etc.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegationRecord {
+    pub delegate: Address,
+    pub depth: u32,
+}
+
+/// Maximum delegation chain depth to prevent unbounded chains.
+pub const MAX_DELEGATION_DEPTH: u32 = 5;
+
 /// Issue #436: A single immutable audit entry for an IP record.
 /// Entries are append-only and can never be modified or removed.
 #[contracttype]
@@ -3007,6 +3019,269 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::ArbitrationCase(arbitration_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound))
+    }
+
+    // ── Issue: IP Commitment Renewal ───────────────────────────────────────────
+
+    /// Renew an expiring IP commitment by extending its on-chain TTL.
+    ///
+    /// Bumps the storage TTL of the IP record back to `LEDGER_BUMP` ledgers
+    /// without creating a new commitment or changing the commitment hash.
+    /// A renewal counter is incremented on each call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist, the caller is not the owner, or the IP
+    /// is revoked.
+    pub fn renew_ip(env: Env, ip_id: u64) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+        require_not_revoked(&env, &record);
+
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RenewalCount(ip_id))
+            .unwrap_or(0u32);
+        let new_count = count + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::RenewalCount(ip_id), &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::RenewalCount(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("renewed"), record.owner),
+            (ip_id, new_count),
+        );
+    }
+
+    /// Get the number of times an IP commitment has been renewed.
+    pub fn get_renewal_count(env: Env, ip_id: u64) -> u32 {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::RenewalCount(ip_id))
+            .unwrap_or(0u32)
+    }
+
+    // ── Issue: Delegation Chains ───────────────────────────────────────────────────────────────
+
+    pub fn delegate_commitment_authority(
+        env: Env,
+        root_owner: Address,
+        delegator: Address,
+        delegate_address: Address,
+    ) {
+        delegator.require_auth();
+
+        let new_depth: u32 = if delegator == root_owner {
+            0
+        } else {
+            let stored: Option<u32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::DelegateDepth(delegator.clone()));
+            match stored {
+                Some(d) => d + 1,
+                None => panic_with_error!(&env, ContractError::Unauthorized),
+            }
+        };
+
+        if new_depth >= MAX_DELEGATION_DEPTH {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        let key = DataKey::Delegates(root_owner.clone());
+        let mut delegates: Vec<DelegationRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        for i in 0..delegates.len() {
+            if delegates.get(i).unwrap().delegate == delegate_address {
+                return;
+            }
+        }
+
+        delegates.push_back(DelegationRecord {
+            delegate: delegate_address.clone(),
+            depth: new_depth,
+        });
+        env.storage().persistent().set(&key, &delegates);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegateDepth(delegate_address.clone()), &new_depth);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegateDepth(delegate_address.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("delegated"), root_owner),
+            (delegate_address, new_depth),
+        );
+    }
+
+    pub fn revoke_delegation(env: Env, owner: Address, delegate_address: Address) {
+        owner.require_auth();
+
+        let key = DataKey::Delegates(owner.clone());
+        let delegates: Vec<DelegationRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut updated = Vec::new(&env);
+        for i in 0..delegates.len() {
+            let rec = delegates.get(i).unwrap();
+            if rec.delegate != delegate_address {
+                updated.push_back(rec);
+            }
+        }
+
+        env.storage().persistent().set(&key, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DelegateDepth(delegate_address.clone()));
+
+        env.events().publish(
+            (symbol_short!("revoke"), owner),
+            delegate_address,
+        );
+    }
+
+    pub fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool {
+        Self::is_delegate_in_chain(&env, &owner, &delegate_address, 0)
+    }
+
+    pub fn commit_ip_delegated(
+        env: Env,
+        owner: Address,
+        commitment_hash: BytesN<32>,
+        pow_difficulty: u32,
+    ) -> u64 {
+        owner.require_auth();
+
+        let key = DataKey::Delegates(owner.clone());
+        let delegates: Vec<DelegationRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        if delegates.is_empty() {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        require_non_zero_commitment(&env, &commitment_hash);
+        require_unique_commitment(&env, &commitment_hash);
+        require_pow(&env, &commitment_hash, pow_difficulty);
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let record = IpRecord {
+            ip_id: id,
+            owner: owner.clone(),
+            commitment_hash: commitment_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+            revoked: false,
+            co_owners: Vec::new(&env),
+            parent_ip_id: None,
+            notary_signature: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(owner.clone()), &ids);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnerIps(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("ip_commit"), owner.clone()),
+            (id, record.timestamp),
+        );
+
+        Self::update_commitment_checksum(&env);
+
+        id
+    }
+
+    fn is_delegate_in_chain(
+        env: &Env,
+        root: &Address,
+        candidate: &Address,
+        depth: u32,
+    ) -> bool {
+        if depth >= MAX_DELEGATION_DEPTH {
+            return false;
+        }
+        let key = DataKey::Delegates(root.clone());
+        let delegates: Vec<DelegationRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+
+        for i in 0..delegates.len() {
+            let rec = delegates.get(i).unwrap();
+            if &rec.delegate == candidate {
+                return true;
+            }
+            if Self::is_delegate_in_chain(env, &rec.delegate, candidate, depth + 1) {
+                return true;
+            }
+        }
+        false
     }
 }
 

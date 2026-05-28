@@ -354,3 +354,27 @@ If you have questions about the commitment scheme:
 - Open a [GitHub Issue](https://github.com/AtomicIP/AtomicIP-/issues)
 - Join our [Discord community](https://discord.gg/atomicip)
 - Email: support@atomicip.io
+
+## Commitment Renewal
+
+IP commitments have an on-chain TTL of approximately 1 year (~6,307,200 ledgers). Owners can renew
+an expiring commitment without re-committing or changing the commitment hash:
+
+```rust
+fn renew_ip(ip_id: u64)
+```
+
+- Requires owner authorization
+- Resets the storage TTL back to `LEDGER_BUMP` (~1 year)
+- Increments an on-chain renewal counter (queryable via `get_renewal_count`)
+- Emits a `renewed` event with `(ip_id, renewal_count)`
+- Panics if the IP is revoked or does not exist
+
+The original commitment hash, timestamp, and owner are **never modified** by renewal — prior art
+proof is fully preserved.
+
+```rust
+fn get_renewal_count(ip_id: u64) -> u32
+```
+
+Returns how many times the IP has been renewed (0 if never renewed).
