@@ -220,3 +220,113 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid secrets
 - [Security Considerations](security.md) — Best practices for key management
 - [Threat Model](threat-model.md) — Attack vectors and mitigations
+
+---
+
+## Batch Operations (#469)
+
+Batch functions allow a seller or buyer to initiate, accept, or complete multiple swaps in a single transaction, reducing fees and round-trips.
+
+### batch_initiate_swap
+
+Seller initiates multiple patent sales at once. All swaps share the same buyer and payment token.
+
+```rust
+let swap_ids: Vec<u64> = swap_contract.batch_initiate_swap(
+    token,       // Payment token (same for all swaps)
+    ip_ids,      // Vec of IP IDs to sell
+    seller,      // Seller address (requires auth)
+    prices,      // Vec of prices — prices[i] corresponds to ip_ids[i]
+    buyer,       // Buyer address
+    0,           // required_approvals (0 = none)
+    None,        // referrer
+);
+```
+
+**Constraints:**
+- `ip_ids.len() == prices.len()`
+- Seller must own every IP in `ip_ids`
+- No active swap may exist for any of the IPs
+- All prices must be > 0
+
+**Result:** Returns a `Vec<u64>` of the newly created swap IDs, one per IP.
+
+---
+
+### batch_accept_swaps
+
+Buyer accepts multiple Pending swaps in one call. Payment for each swap is transferred to the contract.
+
+```rust
+swap_contract.batch_accept_swaps(
+    swap_ids,  // Vec of swap IDs to accept
+    buyer,     // Buyer address (requires auth)
+);
+```
+
+**Constraints:**
+- Every swap must be in `Pending` state
+- `buyer` must match the `buyer` field on each swap
+- Required approvals (if any) must already be collected
+
+**Result:** All swaps move to `Accepted`. A single `BatchAccepted` event is emitted.
+
+---
+
+### batch_reveal_keys
+
+Seller reveals decryption keys for multiple Accepted swaps in one call. Each key is verified; payment is released per swap.
+
+```rust
+swap_contract.batch_reveal_keys(
+    swap_ids,         // Vec of swap IDs
+    secrets,          // Vec of secrets — secrets[i] for swap_ids[i]
+    blinding_factors, // Vec of blinding factors
+    seller,           // Seller address (requires auth)
+);
+```
+
+**Constraints:**
+- `swap_ids`, `secrets`, and `blinding_factors` must all have the same length
+- Every swap must be in `Accepted` state
+- Seller must be the initiator of every swap
+- Every `verify_commitment(ip_id, secret, blinding_factor)` must return `true`
+
+**Result:** All swaps move to `Completed`. Protocol fees are deducted per swap. A single `BatchKeysRevealed` event is emitted.
+
+---
+
+### Batch Flow Example
+
+```rust
+// 1. Seller lists three IPs for sale in one transaction
+let swap_ids = swap_contract.batch_initiate_swap(
+    xlm_token,
+    vec![ip_id_1, ip_id_2, ip_id_3],
+    seller,
+    vec![100_000_000, 200_000_000, 50_000_000],
+    buyer,
+    0,
+    None,
+);
+
+// 2. Buyer accepts all three (sends total payment in one call)
+swap_contract.batch_accept_swaps(swap_ids.clone(), buyer);
+
+// 3. Seller reveals all three keys (completes all swaps in one call)
+swap_contract.batch_reveal_keys(
+    swap_ids,
+    vec![secret_1, secret_2, secret_3],
+    vec![blinding_1, blinding_2, blinding_3],
+    seller,
+);
+```
+
+### Events
+
+| Event | Symbol | Emitted by |
+|---|---|---|
+| `BatchAcceptedEvent` | `btch_acp` | `batch_accept_swaps` |
+| `BatchKeysRevealedEvent` | `btch_key` | `batch_reveal_keys` |
+
+Individual `SwapInitiatedEvent` events are still emitted per swap inside `batch_initiate_swap`.
