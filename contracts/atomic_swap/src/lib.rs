@@ -56,6 +56,9 @@ pub enum ContractError {
     FuncChanged = 31,
     InsufficientReputation = 40,
     ArbitrationNotTimedOut = 41,
+    NotAllSigned = 42,
+    AlreadySigned = 43,
+    NotARequiredSigner = 44,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -134,6 +137,10 @@ pub enum DataKey {
     ReputationMultiplier(u64),
     /// Maps swap_id → timestamp when arbitration was requested.
     ArbitrationTimestamp(u64),
+    /// Maps swap_id → Vec<Address> of required co-signers for key reveal.
+    SwapSigners(u64),
+    /// Maps swap_id → Vec<Address> of signers who have already signed off.
+    SwapSignatures(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -515,6 +522,25 @@ impl AtomicSwap {
         );
 
         // Verify commitment via IP registry
+        // Guard: if this swap has required signers, all must have signed before reveal.
+        if env.storage().persistent().has(&DataKey::SwapSigners(swap_id)) {
+            let signers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSigners(swap_id))
+                .unwrap_or(Vec::new(&env));
+            let signed: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSignatures(swap_id))
+                .unwrap_or(Vec::new(&env));
+            if signed.len() < signers.len() {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotAllSigned as u32,
+                ));
+            }
+        }
+
         let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
         if !valid {
             // #354: If insurance is enabled, mark swap as claimable before panicking.
@@ -2924,6 +2950,138 @@ impl AtomicSwap {
             (soroban_sdk::symbol_short!("esc_wdr"),),
             SwapCancelledEvent { swap_id, canceller: swap.buyer },
         );
+    }
+
+    // ── Multi-party reveal (co-inventor sign-off) ─────────────────────────────
+
+    /// Initiate a swap that requires all `signers` to call `sign_swap_reveal`
+    /// before the seller can call `reveal_key`. The seller must be included in
+    /// `signers` or they can still call `reveal_key` once all signers have signed.
+    /// Returns the swap ID.
+    pub fn initiate_swap_with_signers(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        price: i128,
+        buyer: Address,
+        signers: Vec<Address>,
+    ) -> u64 {
+        require_not_paused(&env);
+        seller.require_auth();
+        require_positive_price(&env, price);
+        registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+        require_no_active_swap(&env, ip_id);
+
+        if signers.is_empty() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+
+        let swap = SwapRecord {
+            ip_id,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price,
+            token: token.clone(),
+            status: SwapStatus::Pending,
+            expiry: env.ledger().timestamp() + 604800u64,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            insurance_enabled: false,
+            escrow_agent: None,
+            quantity: 1,
+            conditions: Vec::new(&env),
+        };
+
+        env.storage().persistent().set(&DataKey::Swap(id), &swap);
+        env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::ActiveSwap(ip_id), &id);
+        env.storage().persistent().extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Store required signers
+        env.storage().persistent().set(&DataKey::SwapSigners(id), &signers);
+        env.storage().persistent().extend_ttl(&DataKey::SwapSigners(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+        let mut ip_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpSwaps(ip_id))
+            .unwrap_or(Vec::new(&env));
+        ip_ids.push_back(id);
+        env.storage().persistent().set(&DataKey::IpSwaps(ip_id), &ip_ids);
+        env.storage().persistent().extend_ttl(&DataKey::IpSwaps(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        Self::append_history(&env, id, SwapStatus::Pending);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_init"),),
+            SwapInitiatedEvent { swap_id: id, ip_id, seller, buyer, price },
+        );
+
+        id
+    }
+
+    /// A required signer signs off on the key reveal for a swap.
+    /// Once all required signers have signed, `reveal_key` is unblocked.
+    pub fn sign_swap_reveal(env: Env, swap_id: u64, signer: Address) {
+        signer.require_auth();
+
+        let swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Accepted, ContractError::NotAccepted);
+
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapSigners(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::Unauthorized as u32,
+                ))
+            });
+
+        // Verify signer is in the required list
+        let mut is_required = false;
+        for i in 0..signers.len() {
+            if signers.get(i).unwrap() == signer {
+                is_required = true;
+                break;
+            }
+        }
+        if !is_required {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NotARequiredSigner as u32,
+            ));
+        }
+
+        let mut signed: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapSignatures(swap_id))
+            .unwrap_or(Vec::new(&env));
+
+        // Prevent duplicate signatures
+        for i in 0..signed.len() {
+            if signed.get(i).unwrap() == signer {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::AlreadySigned as u32,
+                ));
+            }
+        }
+
+        signed.push_back(signer);
+        env.storage().persistent().set(&DataKey::SwapSignatures(swap_id), &signed);
+        env.storage().persistent().extend_ttl(&DataKey::SwapSignatures(swap_id), LEDGER_BUMP, LEDGER_BUMP);
     }
 
     // ── Reputation ────────────────────────────────────────────────────────────
