@@ -95,6 +95,8 @@ pub enum DataKey {
     OwnerIps(Address),
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
+    /// Maps commitment hash -> blinded owner identifier for anonymous commits
+    AnonymousOwner(BytesN<32>),
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
@@ -111,26 +113,22 @@ pub enum DataKey {
     EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
     NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
-    // Used by existing code (missing from enum)
-    CompressedCommitment(u64), // Issue #438: stores 16-byte compressed commitment for an IP
-    ShardIps(u32),             // Issue #437: stores Vec<u64> of IP IDs in a shard
-    IpAuditTrail(u64),         // Issue #436: stores Vec<AuditEntry> for an IP
-    IpDisputes(u64),           // stores DisputeRecord for a given dispute_id
-    NextDisputeId,             // monotonic dispute ID counter
-    ArbitrationCase(u64),      // stores ArbitrationRecord for a given arbitration_id
-    NextArbitrationId,         // monotonic arbitration ID counter
-    ArbitratorPool,            // stores Vec<Address> of nominated arbitrators
-    IpStake(u64),              // Issue #447: stores StakeRecord for a given ip_id
-    ReputationScore(Address),  // Issue #448: stores ReputationRecord for an owner
-    // Issues #454-#457
-    ThresholdConfig(u64),      // Issue #454: stores ThresholdConfig for a given ip_id
-    ThresholdSignatures(u64),  // Issue #454: stores Vec<ThresholdSignature> for a given ip_id
-    BatchMetadata(u64),        // Issue #455: stores BatchMetadata for a given ip_id
-    CompressionAlgorithm(u64), // Issue #456: stores CompressionAlgorithm for a given ip_id
-    EncryptedCommitment(u64),  // Issue #457: stores EncryptedCommitment for a given ip_id
+    IpPowDifficulty(u64),   // stores the pow_difficulty used at commit time for strength scoring
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
+
+/// Delegation chain record: tracks a delegate and the depth at which they were granted authority.
+/// Depth 0 = direct delegate of the owner; depth 1 = delegate of a delegate, etc.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegationRecord {
+    pub delegate: Address,
+    pub depth: u32,
+}
+
+/// Maximum delegation chain depth to prevent unbounded chains.
+pub const MAX_DELEGATION_DEPTH: u32 = 5;
 
 /// Issue #436: A single immutable audit entry for an IP record.
 /// Entries are append-only and can never be modified or removed.
@@ -384,6 +382,16 @@ impl IpRegistry {
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
 
+        // Store pow_difficulty for strength scoring (Issue: entropy/complexity scoring)
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpPowDifficulty(id), &pow_difficulty);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpPowDifficulty(id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
         // Append to owner index
         let mut ids: Vec<u64> = env
             .storage()
@@ -564,6 +572,168 @@ impl IpRegistry {
         Self::update_commitment_checksum(&env);
 
         ids
+    }
+
+    /// Commit multiple IP commitments anonymously in a single transaction.
+    ///
+    /// Stores a blinded owner identifier alongside each commitment so ownership
+    /// can be proven off-chain or revealed later without exposing the on-chain
+    /// owner address at commit time. The on-chain `IpRecord.owner` is set to
+    /// the contract address as a placeholder to avoid leaking the submitter.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `blinded_owner` - A 32-byte blinded owner identifier (e.g. `sha256(owner || nonce)`).
+    ///   Stored on-chain per commitment so ownership can be proved or revealed later.
+    /// * `commitment_hashes` - Non-empty vector of 32-byte commitment hashes to register.
+    ///   Each must not be all zeros and must be globally unique.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<u64>` — Assigned IP IDs in the same order as the input hashes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * `commitment_hashes` is empty (panics with `ZeroCommitmentHash` on the first iteration
+    ///   — callers should not pass an empty vector)
+    /// * Any `commitment_hash` is all zeros (`ZeroCommitmentHash` error, code 2)
+    /// * Any `commitment_hash` is already registered (`CommitmentAlreadyRegistered` error, code 3)
+    ///
+    /// # Auth Model
+    ///
+    /// No caller authorization is required. The submitter's identity is intentionally
+    /// not recorded on-chain; only the `blinded_owner` identifier is stored.
+    ///
+    /// # Events
+    ///
+    /// Emits one `"ip_commit_anon"` event per commitment:
+    /// - Topics: `(symbol_short!("ip_commit_anon"), contract_address)`
+    /// - Data: `(ip_id: u64, timestamp: u64, blinded_owner: BytesN<32>)`
+    ///
+    /// # Storage
+    ///
+    /// Per commitment hash, two persistent keys are written:
+    /// - `DataKey::CommitmentOwner(hash)` → contract address (duplicate guard)
+    /// - `DataKey::AnonymousOwner(hash)` → `blinded_owner` (ownership proof pointer)
+    pub fn batch_commit_ip_anonymous(
+        env: Env,
+        blinded_owner: BytesN<32>,
+        commitment_hashes: Vec<BytesN<32>>,
+    ) -> Vec<u64> {
+        // No caller auth required for anonymous commits.
+
+        // Reject empty batch — nothing to commit.
+        if commitment_hashes.is_empty() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ZeroCommitmentHash as u32,
+            ));
+        }
+
+        // Initialize admin on first call if not set
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            let admin = env.current_contract_address();
+            env.storage().persistent().set(&DataKey::Admin, &admin);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Admin, 50000, 50000);
+        }
+
+        let mut ids = Vec::new(&env);
+        let timestamp = env.ledger().timestamp();
+
+        for commitment_hash in commitment_hashes.iter() {
+            // Reject zero-byte commitment hash
+            require_non_zero_commitment(&env, &commitment_hash);
+
+            // Reject duplicate commitment hash globally
+            require_unique_commitment(&env, &commitment_hash);
+
+            // NextId lives in persistent storage so it survives contract upgrades.
+            let id: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::NextId)
+                .unwrap_or(1);
+
+            let record = IpRecord {
+                ip_id: id,
+                owner: env.current_contract_address(),
+                commitment_hash: commitment_hash.clone(),
+                timestamp,
+                revoked: false,
+                co_owners: Vec::new(&env),
+                parent_ip_id: None,
+                notary_signature: None,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpRecord(id), &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+            // Do NOT append to OwnerIps index to preserve anonymity.
+
+            // Track commitment hash ownership to prevent duplicates
+            env.storage()
+                .persistent()
+                .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &env.current_contract_address());
+            env.storage().persistent().extend_ttl(
+                &DataKey::CommitmentOwner(commitment_hash.clone()),
+                50000,
+                50000,
+            );
+
+            // Record blinded owner mapping for later on-chain/off-chain proof if needed.
+            env.storage()
+                .persistent()
+                .set(&DataKey::AnonymousOwner(commitment_hash.clone()), &blinded_owner);
+            env.storage().persistent().extend_ttl(
+                &DataKey::AnonymousOwner(commitment_hash.clone()),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            env.events().publish(
+                (symbol_short!("ip_commit_anon"), env.current_contract_address()),
+                (id, timestamp, blinded_owner.clone()),
+            );
+
+            ids.push_back(id);
+
+            env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        // Issue #346: Update commitment checksum for rollback protection
+        Self::update_commitment_checksum(&env);
+
+        ids
+    }
+
+    /// Retrieve the blinded owner identifier stored for an anonymous commitment.
+    ///
+    /// Returns `Some(blinded_owner)` if the commitment was registered via
+    /// `batch_commit_ip_anonymous`, or `None` if no anonymous owner record exists
+    /// for the given hash (e.g. it was committed via `commit_ip` or `batch_commit_ip`).
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_hash` - The 32-byte commitment hash to look up
+    ///
+    /// # Returns
+    ///
+    /// `Option<BytesN<32>>` — The blinded owner identifier, or `None`.
+    pub fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AnonymousOwner(commitment_hash))
     }
 
     /// Transfer IP ownership to a new address.
@@ -848,6 +1018,50 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::PowDifficulty)
             .unwrap_or(4u32)
+    }
+
+    /// Returns the entropy-and-complexity strength score (0–100) for an IP commitment.
+    ///
+    /// The score combines:
+    /// - **Byte entropy**: number of unique bytes in the 32-byte commitment hash,
+    ///   scaled to 0–50 (max 32 unique bytes → 50 points).
+    /// - **PoW difficulty**: the `pow_difficulty` used at commit time, scaled to 0–50
+    ///   (each difficulty bit contributes ~1.5625 points, capped at 50).
+    ///
+    /// Weak commitments (e.g. all-same-byte hashes or zero PoW) score low; strong,
+    /// high-entropy commitments with meaningful PoW score near 100.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `IpNotFound` if the IP does not exist.
+    pub fn get_ip_strength(env: Env, ip_id: u64) -> u32 {
+        let record = require_ip_exists(&env, ip_id);
+        let pow_difficulty: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpPowDifficulty(ip_id))
+            .unwrap_or(0u32);
+
+        let hash_bytes = record.commitment_hash.to_array();
+
+        // Count unique bytes as a proxy for byte-level entropy (0–32 unique values)
+        let mut seen = [false; 256];
+        for b in hash_bytes.iter() {
+            seen[*b as usize] = true;
+        }
+        let unique_bytes = seen.iter().filter(|&&v| v).count() as u32;
+
+        // Scale unique_bytes (0–32) to 0–50
+        let entropy_score = (unique_bytes * 50) / 32;
+
+        // Scale pow_difficulty to 0–50 (32 bits max → 50 points)
+        let pow_score = if pow_difficulty >= 32 {
+            50u32
+        } else {
+            (pow_difficulty * 50) / 32
+        };
+
+        (entropy_score + pow_score).min(100)
     }
 
     /// Returns the current protocol configuration.
@@ -1642,13 +1856,23 @@ impl IpRegistry {
 
     // ── Issue #344: Tiered Access Control ──────────────────────────────────────
 
-    /// Grant access to an IP for a third party. Owner-only.
-    /// access_level: 0 = none, 1 = read-only, 2 = read-write
+    /// Grant tiered access to an IP for a third party. Owner-only.
+    ///
+    /// Access tiers are hierarchical — a higher tier implies all lower tiers:
+    /// - `1` = **view**: read IP metadata
+    /// - `2` = **verify**: view + verify the commitment
+    /// - `3` = **transfer**: view + verify + initiate transfer
+    ///
+    /// Granting to an address that already has a grant updates the level.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if `access_level` is 0 or > 3, or if caller is not the owner.
     pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
-        if access_level > 2 {
+        if access_level < 1 || access_level > 3 {
             env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
         }
 
@@ -1667,7 +1891,7 @@ impl IpRegistry {
             }
         }
         if !found {
-            grants.push_back(IpAccessGrant { grantee, access_level });
+            grants.push_back(IpAccessGrant { grantee: grantee.clone(), access_level });
         }
 
         env.storage()
@@ -1678,9 +1902,15 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        env.events().publish(
+            (symbol_short!("ac_grant"), ip_id),
+            (grantee, access_level),
+        );
     }
 
     /// Revoke access to an IP from a third party. Owner-only.
+    /// No-op if the grantee has no grant.
     pub fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
@@ -1701,6 +1931,11 @@ impl IpRegistry {
                 LEDGER_BUMP,
                 LEDGER_BUMP,
             );
+
+            env.events().publish(
+                (symbol_short!("ac_revoke"), ip_id),
+                grantee,
+            );
         }
     }
 
@@ -1711,6 +1946,31 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpAccessGrants(ip_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Check whether `grantee` has at least `required_level` access to `ip_id`.
+    ///
+    /// The owner always has full access (level 3). Tiers are hierarchical:
+    /// a grantee with level 3 satisfies a check for level 1 or 2.
+    ///
+    /// Returns `true` if access is granted, `false` otherwise.
+    pub fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+        // Owner always has full access
+        if grantee == record.owner {
+            return true;
+        }
+        let grants: Vec<IpAccessGrant> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpAccessGrants(ip_id))
+            .unwrap_or(Vec::new(&env));
+        for grant in grants.iter() {
+            if grant.grantee == grantee {
+                return grant.access_level >= required_level;
+            }
+        }
+        false
     }
 
     // ── Issue #345 / #428: Timestamp Notarization ──────────────────────────────
@@ -2835,351 +3095,267 @@ impl IpRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound))
     }
 
-    // ── Issue #454: IP Commitment Threshold Signatures ────────────────────────
+    // ── Issue: IP Commitment Renewal ───────────────────────────────────────────
 
-    /// Configure M-of-N threshold signature requirement for an IP commitment.
+    /// Renew an expiring IP commitment by extending its on-chain TTL.
     ///
-    /// The IP owner sets how many signers (M) out of a total authorized list (N)
-    /// must sign before the commitment is considered verified.
+    /// Bumps the storage TTL of the IP record back to `LEDGER_BUMP` ledgers
+    /// without creating a new commitment or changing the commitment hash.
+    /// A renewal counter is incremented on each call.
     ///
     /// # Panics
     ///
-    /// Panics if the IP does not exist, caller is not the owner, or threshold > total.
-    pub fn require_threshold_signatures(
-        env: Env,
-        ip_id: u64,
-        threshold: u32,
-        signers: Vec<Address>,
-    ) {
+    /// Panics if the IP does not exist, the caller is not the owner, or the IP
+    /// is revoked.
+    pub fn renew_ip(env: Env, ip_id: u64) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
+        require_not_revoked(&env, &record);
 
-        let total = signers.len();
-        if threshold == 0 || threshold > total {
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RenewalCount(ip_id))
+            .unwrap_or(0u32);
+        let new_count = count + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::RenewalCount(ip_id), &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::RenewalCount(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("renewed"), record.owner),
+            (ip_id, new_count),
+        );
+    }
+
+    /// Get the number of times an IP commitment has been renewed.
+    pub fn get_renewal_count(env: Env, ip_id: u64) -> u32 {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::RenewalCount(ip_id))
+            .unwrap_or(0u32)
+    }
+
+    // ── Issue: Delegation Chains ───────────────────────────────────────────────────────────────
+
+    pub fn delegate_commitment_authority(
+        env: Env,
+        root_owner: Address,
+        delegator: Address,
+        delegate_address: Address,
+    ) {
+        delegator.require_auth();
+
+        let new_depth: u32 = if delegator == root_owner {
+            0
+        } else {
+            let stored: Option<u32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::DelegateDepth(delegator.clone()));
+            match stored {
+                Some(d) => d + 1,
+                None => panic_with_error!(&env, ContractError::Unauthorized),
+            }
+        };
+
+        if new_depth >= MAX_DELEGATION_DEPTH {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
 
-        let config = ThresholdConfig {
-            ip_id,
-            threshold,
-            total,
-            signers,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::ThresholdConfig(ip_id), &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::ThresholdConfig(ip_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish(
-            (symbol_short!("thr_set"), record.owner),
-            (ip_id, threshold, total),
-        );
-    }
-
-    /// Add a threshold signature for an IP commitment.
-    ///
-    /// An authorized signer submits `sha256(commitment_hash || signer_address_bytes)`.
-    /// Each signer may only sign once.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IP does not exist, no threshold config is set, the signer is
-    /// not in the authorized list, or the signer has already signed.
-    pub fn add_threshold_signature(
-        env: Env,
-        ip_id: u64,
-        signer: Address,
-        signature_hash: BytesN<32>,
-    ) {
-        signer.require_auth();
-        let record = require_ip_exists(&env, ip_id);
-
-        let config: ThresholdConfig = env
+        let key = DataKey::Delegates(root_owner.clone());
+        let mut delegates: Vec<DelegationRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::ThresholdConfig(ip_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
-
-        // Verify signer is authorized
-        let mut authorized = false;
-        for s in config.signers.iter() {
-            if s == signer {
-                authorized = true;
-                break;
-            }
-        }
-        if !authorized {
-            panic_with_error!(&env, ContractError::SignerNotAuthorized);
-        }
-
-        // Load existing signatures
-        let mut sigs: Vec<ThresholdSignature> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ThresholdSignatures(ip_id))
+            .get(&key)
             .unwrap_or(Vec::new(&env));
 
-        // Reject duplicate signer
-        for existing in sigs.iter() {
-            if existing.signer == signer {
-                panic_with_error!(&env, ContractError::AlreadySigned);
+        for i in 0..delegates.len() {
+            if delegates.get(i).unwrap().delegate == delegate_address {
+                return;
             }
         }
 
-        // Verify signature_hash = sha256(commitment_hash || signer_bytes)
-        // We accept the caller's hash as-is (they prove knowledge by providing it);
-        // on-chain we store it for later verification.
-        sigs.push_back(ThresholdSignature {
-            signer: signer.clone(),
-            signature_hash,
-            timestamp: env.ledger().timestamp(),
+        delegates.push_back(DelegationRecord {
+            delegate: delegate_address.clone(),
+            depth: new_depth,
         });
+        env.storage().persistent().set(&key, &delegates);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 
         env.storage()
             .persistent()
-            .set(&DataKey::ThresholdSignatures(ip_id), &sigs);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::ThresholdSignatures(ip_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish(
-            (symbol_short!("thr_sig"), signer),
-            (ip_id, sigs.len()),
+            .set(&DataKey::DelegateDepth(delegate_address.clone()), &new_depth);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegateDepth(delegate_address.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
         );
 
-        let _ = record; // suppress unused warning
+        env.events().publish(
+            (symbol_short!("delegated"), root_owner),
+            (delegate_address, new_depth),
+        );
     }
 
-    /// Verify that the M-of-N threshold has been met for an IP commitment.
-    ///
-    /// Returns `true` if the number of collected signatures meets or exceeds
-    /// the configured threshold, `false` otherwise.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IP does not exist or no threshold config is set.
-    pub fn verify_threshold_signatures(env: Env, ip_id: u64) -> bool {
-        require_ip_exists(&env, ip_id);
+    pub fn revoke_delegation(env: Env, owner: Address, delegate_address: Address) {
+        owner.require_auth();
 
-        let config: ThresholdConfig = env
+        let key = DataKey::Delegates(owner.clone());
+        let delegates: Vec<DelegationRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::ThresholdConfig(ip_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
-
-        let sigs: Vec<ThresholdSignature> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ThresholdSignatures(ip_id))
+            .get(&key)
             .unwrap_or(Vec::new(&env));
 
-        sigs.len() >= config.threshold
-    }
-
-    /// Get the threshold configuration for an IP.
-    pub fn get_threshold_config(env: Env, ip_id: u64) -> Option<ThresholdConfig> {
-        require_ip_exists(&env, ip_id);
-        env.storage()
-            .persistent()
-            .get(&DataKey::ThresholdConfig(ip_id))
-    }
-
-    /// Get all threshold signatures collected for an IP.
-    pub fn get_threshold_signatures(env: Env, ip_id: u64) -> Vec<ThresholdSignature> {
-        require_ip_exists(&env, ip_id);
-        env.storage()
-            .persistent()
-            .get(&DataKey::ThresholdSignatures(ip_id))
-            .unwrap_or(Vec::new(&env))
-    }
-
-    // ── Issue #455: IP Commitment Batch Metadata ──────────────────────────────
-
-    /// Attach metadata to a batch commitment.
-    ///
-    /// The IP owner sets a batch ID and description for an IP. Description is
-    /// capped at MAX_METADATA_BYTES (1 KB).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IP does not exist, caller is not the owner, or description
-    /// exceeds MAX_METADATA_BYTES.
-    pub fn set_batch_metadata(
-        env: Env,
-        ip_id: u64,
-        batch_id: BytesN<32>,
-        description: Bytes,
-    ) {
-        let record = require_ip_exists(&env, ip_id);
-        record.owner.require_auth();
-
-        if description.len() > MAX_METADATA_BYTES {
-            panic_with_error!(&env, ContractError::BatchMetadataTooLarge);
+        let mut updated = Vec::new(&env);
+        for i in 0..delegates.len() {
+            let rec = delegates.get(i).unwrap();
+            if rec.delegate != delegate_address {
+                updated.push_back(rec);
+            }
         }
 
-        let meta = BatchMetadata {
-            ip_id,
-            batch_id: batch_id.clone(),
-            description,
-            timestamp: env.ledger().timestamp(),
-        };
+        env.storage().persistent().set(&key, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 
         env.storage()
             .persistent()
-            .set(&DataKey::BatchMetadata(ip_id), &meta);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::BatchMetadata(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+            .remove(&DataKey::DelegateDepth(delegate_address.clone()));
 
         env.events().publish(
-            (symbol_short!("batch_m"), record.owner),
-            (ip_id, batch_id),
+            (symbol_short!("revoke"), owner),
+            delegate_address,
         );
     }
 
-    /// Retrieve the batch metadata for an IP.
-    ///
-    /// Returns `None` if no metadata has been set.
-    pub fn get_batch_metadata(env: Env, ip_id: u64) -> Option<BatchMetadata> {
-        require_ip_exists(&env, ip_id);
-        env.storage()
-            .persistent()
-            .get(&DataKey::BatchMetadata(ip_id))
+    pub fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool {
+        Self::is_delegate_in_chain(&env, &owner, &delegate_address, 0)
     }
 
-    // ── Issue #456: IP Commitment Compression Algorithm Selection ─────────────
+    pub fn commit_ip_delegated(
+        env: Env,
+        owner: Address,
+        commitment_hash: BytesN<32>,
+        pow_difficulty: u32,
+    ) -> u64 {
+        owner.require_auth();
 
-    /// Set the compression algorithm for an IP commitment.
-    ///
-    /// The IP owner selects which algorithm to use when compressing the commitment
-    /// hash for storage. Defaults to `Truncate16` if not set.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IP does not exist or caller is not the owner.
-    pub fn set_commitment_compression(env: Env, ip_id: u64, algorithm: CompressionAlgo) {
-        let record = require_ip_exists(&env, ip_id);
-        record.owner.require_auth();
-
-        let selection = CompressionSelection {
-            ip_id,
-            algorithm: algorithm.clone(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::CompressionAlgorithm(ip_id), &selection);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::CompressionAlgorithm(ip_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish(
-            (symbol_short!("comp_set"), record.owner),
-            ip_id,
-        );
-    }
-
-    /// Get the compression algorithm selection for an IP.
-    ///
-    /// Returns `CompressionAlgo::Truncate16` if none has been set (the default).
-    pub fn get_commitment_compression(env: Env, ip_id: u64) -> CompressionAlgo {
-        require_ip_exists(&env, ip_id);
-        env.storage()
-            .persistent()
-            .get::<DataKey, CompressionSelection>(&DataKey::CompressionAlgorithm(ip_id))
-            .map(|s| s.algorithm)
-            .unwrap_or(CompressionAlgo::Truncate16)
-    }
-
-    /// Apply the selected compression algorithm to a commitment hash and return
-    /// the compressed bytes.
-    ///
-    /// - `None`       → returns the full 32-byte hash as `Bytes`
-    /// - `Truncate16` → returns the first 16 bytes
-    /// - `Xor8`       → XOR-folds the 32 bytes into 8 bytes
-    pub fn get_compressed_commitment_by_algo(env: Env, ip_id: u64) -> Bytes {
-        let record = require_ip_exists(&env, ip_id);
-        let algo = env
+        let key = DataKey::Delegates(owner.clone());
+        let delegates: Vec<DelegationRecord> = env
             .storage()
             .persistent()
-            .get::<DataKey, CompressionSelection>(&DataKey::CompressionAlgorithm(ip_id))
-            .map(|s| s.algorithm)
-            .unwrap_or(CompressionAlgo::Truncate16);
-
-        let full = record.commitment_hash.to_array();
-        match algo {
-            CompressionAlgo::None => Bytes::from_array(&env, &full),
-            CompressionAlgo::Truncate16 => {
-                let mut half = [0u8; 16];
-                half.copy_from_slice(&full[..16]);
-                Bytes::from_array(&env, &half)
-            }
-            CompressionAlgo::Xor8 => {
-                let mut folded = [0u8; 8];
-                for (i, byte) in full.iter().enumerate() {
-                    folded[i % 8] ^= byte;
-                }
-                Bytes::from_array(&env, &folded)
-            }
-        }
-    }
-
-    // ── Issue #457: IP Commitment Encryption ──────────────────────────────────
-
-    /// Encrypt and store commitment data at rest using the owner's key.
-    ///
-    /// The owner provides the encrypted form of their commitment hash along with
-    /// a public key hint (e.g. sha256 of their public key) so verifiers know
-    /// which key was used. The encrypted data is capped at 256 bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IP does not exist, caller is not the owner, or encrypted_hash
-    /// exceeds 256 bytes.
-    pub fn encrypt_commitment(
-        env: Env,
-        ip_id: u64,
-        encrypted_hash: Bytes,
-        key_hint: BytesN<32>,
-    ) {
-        let record = require_ip_exists(&env, ip_id);
-        record.owner.require_auth();
-
-        if encrypted_hash.len() > 256 {
-            panic_with_error!(&env, ContractError::EncryptedDataTooLarge);
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        if delegates.is_empty() {
+            panic_with_error!(&env, ContractError::Unauthorized);
         }
 
-        let enc = EncryptedCommitmentRecord {
-            ip_id,
-            encrypted_hash: encrypted_hash.clone(),
-            key_hint: key_hint.clone(),
+        require_non_zero_commitment(&env, &commitment_hash);
+        require_unique_commitment(&env, &commitment_hash);
+        require_pow(&env, &commitment_hash, pow_difficulty);
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let record = IpRecord {
+            ip_id: id,
+            owner: owner.clone(),
+            commitment_hash: commitment_hash.clone(),
             timestamp: env.ledger().timestamp(),
+            revoked: false,
+            co_owners: Vec::new(&env),
+            parent_ip_id: None,
+            notary_signature: None,
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::EncryptedCommitment(ip_id), &enc);
+            .set(&DataKey::IpRecord(id), &record);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::EncryptedCommitment(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+            .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(owner.clone()), &ids);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnerIps(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("enc_set"), record.owner),
-            (ip_id, key_hint),
+            (symbol_short!("ip_commit"), owner.clone()),
+            (id, record.timestamp),
         );
+
+        Self::update_commitment_checksum(&env);
+
+        id
     }
 
-    /// Retrieve the encrypted commitment record for an IP.
-    ///
-    /// Returns `None` if no encrypted commitment has been stored.
-    pub fn get_encrypted_commitment(env: Env, ip_id: u64) -> Option<EncryptedCommitmentRecord> {
-        require_ip_exists(&env, ip_id);
-        env.storage()
+    fn is_delegate_in_chain(
+        env: &Env,
+        root: &Address,
+        candidate: &Address,
+        depth: u32,
+    ) -> bool {
+        if depth >= MAX_DELEGATION_DEPTH {
+            return false;
+        }
+        let key = DataKey::Delegates(root.clone());
+        let delegates: Vec<DelegationRecord> = env
+            .storage()
             .persistent()
-            .get(&DataKey::EncryptedCommitment(ip_id))
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+
+        for i in 0..delegates.len() {
+            let rec = delegates.get(i).unwrap();
+            if &rec.delegate == candidate {
+                return true;
+            }
+            if Self::is_delegate_in_chain(env, &rec.delegate, candidate, depth + 1) {
+                return true;
+            }
+        }
+        false
     }
 }
 

@@ -75,6 +75,7 @@ pub enum SwapStatus {
     Completed,
     Disputed,
     Cancelled,
+    RolledBack,
 }
 
 // SwapRecord is defined in lib.rs (not a contracttype due to Vec<SwapCondition> field)
@@ -389,4 +390,14 @@ pub struct InsurancePayoutEvent {
     pub swap_id: u64,
     pub buyer: Address,
     pub payout_amount: i128,
+}
+
+// ── Rollback Event ────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapRolledBackEvent {
+    pub swap_id: u64,
+    pub buyer_refund: i128,
+    pub treasury_penalty: i128,
 }
