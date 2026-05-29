@@ -141,6 +141,12 @@ initiate_swap(ip_id, price, buyer) -> u64         // Seller initiates a patent s
 accept_swap(swap_id, payment)                     // Buyer accepts and sends payment
 reveal_key(swap_id, decryption_key)               // Seller reveals key; payment releases
 cancel_swap(swap_id)                              // Cancel if key is invalid or timeout
+
+// #470: Price Oracle Integration
+set_oracle(caller, oracle_address, enabled)       // Admin sets the price oracle contract
+get_oracle_config() -> Option<OracleConfig>       // Query current oracle configuration
+get_oracle_price(token) -> i128                   // Fetch current price from oracle
+initiate_swap_with_oracle_price(...)  -> u64      // Initiate swap at oracle-determined price
 ```
 
 ## 🧪 Testing

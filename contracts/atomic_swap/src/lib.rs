@@ -4,6 +4,7 @@ mod swap;
 // mod upgrade;
 mod utils;
 mod multi_currency;
+mod price_oracle;
 mod types;
 
 use soroban_sdk::{
@@ -17,6 +18,10 @@ pub use types::*;
 mod validation;
 use validation::*;
 use multi_currency::{SupportedToken, MultiCurrencyConfig, TokenMetadata};
+use price_oracle::{
+    OracleConfig, OracleConfigSetEvent, OraclePriceUsedEvent,
+    fetch_oracle_price, load_oracle_config, store_oracle_config, validate_price_bounds,
+};
 
 // ── Error Codes ────────────────────────────────────────────────────────────
 
@@ -60,6 +65,11 @@ pub enum ContractError {
     AlreadySigned = 43,
     NotARequiredSigner = 44,
     RollbackWindowExpired = 45,
+    /// #470: Oracle errors
+    OracleNotConfigured = 46,
+    OraclePriceInvalid = 47,
+    OraclePriceBelowMin = 48,
+    OraclePriceAboveMax = 49,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -144,6 +154,8 @@ pub enum DataKey {
     SwapSignatures(u64),
     /// Maps swap_id → ledger timestamp when the swap reached Completed.
     CompletionTimestamp(u64),
+    /// #470: Price oracle configuration (oracle contract address + enabled flag).
+    OracleConfig,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -240,6 +252,88 @@ impl AtomicSwap {
         // backward compatibility against the v1 schema.
         // let schema = upgrade::build_v1_schema(&env);
         // upgrade::store_schema(&env, &schema);
+    }
+
+    // ── #470: Price Oracle ────────────────────────────────────────────────────
+
+    /// Admin sets (or updates) the price oracle contract address.
+    /// Pass `enabled = false` to disable oracle-based pricing without removing the address.
+    pub fn set_oracle(env: Env, caller: Address, oracle_address: Address, enabled: bool) {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotInitialized as u32,
+                ))
+            });
+        if caller != admin {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+        let config = OracleConfig {
+            oracle_address: oracle_address.clone(),
+            enabled,
+        };
+        store_oracle_config(&env, &config);
+        env.events().publish(
+            (symbol_short!("oracle"),),
+            OracleConfigSetEvent { oracle_address, enabled },
+        );
+    }
+
+    /// Returns the current oracle configuration, or `None` if not set.
+    pub fn get_oracle_config(env: Env) -> Option<OracleConfig> {
+        load_oracle_config(&env)
+    }
+
+    /// Fetches the current price for `token` from the configured oracle.
+    /// Useful for off-chain clients to preview the oracle price before initiating a swap.
+    pub fn get_oracle_price(env: Env, token: Address) -> i128 {
+        fetch_oracle_price(&env, &token)
+    }
+
+    /// Seller initiates a swap where the price is fetched from the oracle at call time.
+    /// `min_price` / `max_price` are optional slippage guards (0 = no bound).
+    /// Returns the swap ID.
+    pub fn initiate_swap_with_oracle_price(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        buyer: Address,
+        required_approvals: u32,
+        referrer: Option<Address>,
+        collateral_amount: i128,
+        insurance_enabled: bool,
+        min_price: i128,
+        max_price: i128,
+    ) -> u64 {
+        let oracle_price = fetch_oracle_price(&env, &token);
+        validate_price_bounds(&env, oracle_price, min_price, max_price);
+
+        let swap_id = Self::initiate_swap(
+            env.clone(),
+            token,
+            ip_id,
+            seller,
+            oracle_price,
+            buyer,
+            required_approvals,
+            referrer,
+            collateral_amount,
+            insurance_enabled,
+        );
+
+        env.events().publish(
+            (symbol_short!("ora_price"),),
+            OraclePriceUsedEvent { swap_id, oracle_price },
+        );
+
+        swap_id
     }
 
     /// Seller initiates a patent sale. Returns the swap ID.
