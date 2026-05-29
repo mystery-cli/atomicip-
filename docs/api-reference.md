@@ -726,3 +726,96 @@ pub fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<IpAccessGrant>
 ```
 
 Returns a `Vec<IpAccessGrant>` where each entry has `grantee: Address` and `access_level: u32`.
+
+---
+
+## Issue #458 — Batch Verification with ZK Proofs
+
+### `batch_verify_commitments`
+
+Verify multiple IP commitments in a single call. Each request recomputes `sha256(secret || blinding_factor)` and checks it against the stored commitment hash — the same zero-knowledge proof used by `verify_commitment`.
+
+```rust
+pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult>
+```
+
+#### `VerifyRequest`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP ID to verify |
+| `secret` | `BytesN<32>` | The secret used when committing |
+| `blinding_factor` | `BytesN<32>` | The blinding factor used when committing |
+
+#### `VerifyResult`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP ID that was verified |
+| `valid` | `bool` | `true` if the proof is correct |
+
+#### Panics
+
+Panics with `IpNotFound` (code 1) if any `ip_id` does not exist.
+
+#### Example
+
+```rust
+let requests = vec![
+    VerifyRequest { ip_id: 1, secret: s1, blinding_factor: b1 },
+    VerifyRequest { ip_id: 2, secret: s2, blinding_factor: b2 },
+];
+let results = client.batch_verify_commitments(&requests);
+// results[0].valid == true/false
+```
+
+---
+
+## Issue #459 — Hierarchical Storage for Commitments
+
+Organises IP commitments in a two-level hierarchy: `owner → category → ip_ids`. This enables O(1) category-scoped lookups without scanning the full owner index.
+
+### `assign_ip_to_category`
+
+Assign an IP to a category within the owner's hierarchy. Only the IP owner may call this.
+
+```rust
+pub fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP to categorise |
+| `category_hash` | `BytesN<32>` | 32-byte hash identifying the category (e.g. `sha256(label)`) |
+
+Panics with `IpNotFound` if the IP does not exist, or auth error if caller is not the owner. Duplicate assignments are silently ignored.
+
+### `list_ip_by_category`
+
+List all IP IDs for an owner within a specific category.
+
+```rust
+pub fn list_ip_by_category(env: Env, owner: Address, category_hash: BytesN<32>) -> Vec<u64>
+```
+
+Returns an empty vector if the owner has no IPs in that category.
+
+### `list_owner_categories`
+
+List all category hashes registered for an owner.
+
+```rust
+pub fn list_owner_categories(env: Env, owner: Address) -> Vec<BytesN<32>>
+```
+
+Returns an empty vector if the owner has no categories.
+
+#### Example
+
+```rust
+let category = env.crypto().sha256(&Bytes::from_slice(&env, b"patents"));
+client.assign_ip_to_category(&ip_id, &category);
+
+let ids = client.list_ip_by_category(&owner, &category);
+let cats = client.list_owner_categories(&owner);
+```

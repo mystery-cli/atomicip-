@@ -114,27 +114,25 @@ pub enum DataKey {
     NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
     IpPowDifficulty(u64),   // stores the pow_difficulty used at commit time for strength scoring
-    ThresholdConfig(u64),   // Issue #454: M-of-N signer configuration per IP
-    ThresholdSignatures(u64), // Issue #454: collected threshold signatures per IP
-    BatchMetadata(u64),     // Issue #455: batch metadata for an IP
-    CompressionSelection(u64), // Issue #456: per-IP compression selection
-    EncryptedCommitment(u64), // Issue #457: encrypted commitment record
-    CompressedCommitment(u64),
-    ShardIps(u32),
-    IpAuditTrail(u64),
-    NextDisputeId,
-    IpStake(u64),
-    OwnerReputation(Address),
-    ArbitratorPool,
-    NextArbitrationId,
-    // Issue #449 / #451: arbitration and dispute records
-    ArbitrationCase(u64),
-    IpDisputes(u64),
-    // Issue #450: renewal counters
-    RenewalCount(u64),
-    // Issue #451: delegation chains
-    DelegateDepth(Address),
-    Delegates(Address),
+    // Previously missing variants (used in existing code)
+    ShardIps(u32),          // Issue #437: maps shard_id -> Vec<u64> of IP IDs
+    IpAuditTrail(u64),      // Issue #436: stores Vec<AuditEntry> for a given ip_id
+    RenewalCount(u64),      // stores renewal count for a given ip_id
+    Delegates(Address),     // stores Vec<DelegationRecord> for a given owner
+    DelegateDepth(Address), // stores delegation depth for a given delegate
+    IpDisputes(u64),        // stores DisputeRecord for a given dispute_id
+    NextDisputeId,          // monotonic dispute ID counter
+    IpStake(u64),           // Issue #447: stores StakeRecord for a given ip_id
+    OwnerReputation(Address), // Issue #448: stores ReputationRecord for a given owner
+    ArbitrationCase(u64),   // Issue #449: stores ArbitrationRecord for a given arbitration_id
+    NextArbitrationId,      // Issue #449: monotonic arbitration ID counter
+    ArbitratorPool,         // Issue #449: stores Vec<Address> of registered arbitrators
+    CompressedCommitment(u64), // Issue #438: stores compressed commitment bytes for a given ip_id
+    // Issue #458: Batch verification result cache
+    BatchVerifyResult(BytesN<32>), // maps batch_proof_id -> BatchVerifyResult
+    // Issue #459: Hierarchical storage
+    HierarchyNode(Address, BytesN<32>), // maps (owner, category_hash) -> Vec<u64> of IP IDs
+    OwnerCategories(Address),           // maps owner -> Vec<BytesN<32>> of category hashes
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -303,6 +301,37 @@ pub struct EncryptedCommitmentRecord {
     pub encrypted_hash: Bytes,    // commitment hash encrypted with owner's key
     pub key_hint: BytesN<32>,     // public key hint (e.g. sha256 of owner's public key)
     pub timestamp: u64,
+}
+
+// ── Issue #458: Batch Verification with ZK Proofs ────────────────────────────
+
+/// A single verification request in a batch.
+#[contracttype]
+#[derive(Clone)]
+pub struct VerifyRequest {
+    pub ip_id: u64,
+    pub secret: BytesN<32>,
+    pub blinding_factor: BytesN<32>,
+}
+
+/// Result of a single commitment verification within a batch.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifyResult {
+    pub ip_id: u64,
+    pub valid: bool,
+}
+
+// ── Issue #459: Hierarchical Storage ─────────────────────────────────────────
+
+/// A node in the hierarchical commitment tree.
+/// Organises IPs under owner → category → ip_ids for O(1) category lookups.
+#[contracttype]
+#[derive(Clone)]
+pub struct HierarchyNode {
+    pub owner: Address,
+    pub category_hash: BytesN<32>, // sha256 of the category label
+    pub ip_ids: soroban_sdk::Vec<u64>,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -3580,6 +3609,125 @@ impl IpRegistry {
         }
         false
     }
+
+    // ── Issue #458: Batch Verification with ZK Proofs ─────────────────────────
+
+    /// Verify multiple IP commitments in a single call.
+    ///
+    /// For each request, recomputes `sha256(secret || blinding_factor)` and
+    /// checks it against the stored commitment hash — the same ZK-style proof
+    /// used by `verify_commitment`. Returns one `VerifyResult` per request in
+    /// the same order as the input.
+    ///
+    /// # Arguments
+    ///
+    /// * `requests` - Vec of `VerifyRequest` (ip_id, secret, blinding_factor)
+    ///
+    /// # Returns
+    ///
+    /// `Vec<VerifyResult>` — one entry per request with `valid: true/false`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `IpNotFound` if any `ip_id` does not exist.
+    pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult> {
+        let mut results = Vec::new(&env);
+        for req in requests.iter() {
+            let record = require_ip_exists(&env, req.ip_id);
+            let mut preimage = Bytes::new(&env);
+            preimage.append(&req.secret.into());
+            preimage.append(&req.blinding_factor.into());
+            let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
+            results.push_back(VerifyResult {
+                ip_id: req.ip_id,
+                valid: record.commitment_hash == computed,
+            });
+        }
+        results
+    }
+
+    // ── Issue #459: Hierarchical Storage ─────────────────────────────────────
+
+    /// Assign an IP to a category within the owner's hierarchy.
+    ///
+    /// Stores the IP under `owner → category_hash → ip_ids` for fast
+    /// category-scoped queries. Only the IP owner may call this.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `IpNotFound` if the IP does not exist, or auth error if
+    /// the caller is not the owner.
+    pub fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        let owner = record.owner.clone();
+        let node_key = DataKey::HierarchyNode(owner.clone(), category_hash.clone());
+
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&node_key)
+            .unwrap_or(Vec::new(&env));
+        // Avoid duplicates
+        for existing in ids.iter() {
+            if existing == ip_id {
+                return;
+            }
+        }
+        ids.push_back(ip_id);
+        env.storage().persistent().set(&node_key, &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&node_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        // Track which categories this owner has
+        let cat_key = DataKey::OwnerCategories(owner.clone());
+        let mut cats: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&cat_key)
+            .unwrap_or(Vec::new(&env));
+        let mut found = false;
+        for c in cats.iter() {
+            if c == category_hash {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            cats.push_back(category_hash.clone());
+            env.storage().persistent().set(&cat_key, &cats);
+            env.storage()
+                .persistent()
+                .extend_ttl(&cat_key, LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        env.events().publish(
+            (symbol_short!("ip_cat"), owner),
+            (ip_id, category_hash),
+        );
+    }
+
+    /// List all IP IDs for an owner within a specific category.
+    ///
+    /// Returns an empty vector if the owner has no IPs in that category.
+    pub fn list_ip_by_category(env: Env, owner: Address, category_hash: BytesN<32>) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HierarchyNode(owner, category_hash))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// List all category hashes registered for an owner.
+    ///
+    /// Returns an empty vector if the owner has no categories.
+    pub fn list_owner_categories(env: Env, owner: Address) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnerCategories(owner))
+            .unwrap_or(Vec::new(&env))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -4151,5 +4299,159 @@ mod tests {
 
         let record = client.get_encrypted_commitment(&ip_id).unwrap();
         assert_eq!(record.encrypted_hash, soroban_sdk::Bytes::from_array(&env, &[0x02u8; 32]));
+    }
+
+    // ── Issue #458: Batch Verification Tests ──────────────────────────────────
+
+    #[test]
+    fn test_batch_verify_all_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let secret1 = BytesN::from_array(&env, &[0x01u8; 32]);
+        let blind1 = BytesN::from_array(&env, &[0x02u8; 32]);
+        let mut pre1 = soroban_sdk::Bytes::new(&env);
+        pre1.append(&secret1.clone().into());
+        pre1.append(&blind1.clone().into());
+        let hash1: BytesN<32> = env.crypto().sha256(&pre1).into();
+
+        let secret2 = BytesN::from_array(&env, &[0x03u8; 32]);
+        let blind2 = BytesN::from_array(&env, &[0x04u8; 32]);
+        let mut pre2 = soroban_sdk::Bytes::new(&env);
+        pre2.append(&secret2.clone().into());
+        pre2.append(&blind2.clone().into());
+        let hash2: BytesN<32> = env.crypto().sha256(&pre2).into();
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back(VerifyRequest { ip_id: id1, secret: secret1, blinding_factor: blind1 });
+        requests.push_back(VerifyRequest { ip_id: id2, secret: secret2, blinding_factor: blind2 });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap().valid);
+        assert!(results.get(1).unwrap().valid);
+    }
+
+    #[test]
+    fn test_batch_verify_invalid_proof() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let blind = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&blind.clone().into());
+        let hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        // Wrong blinding factor
+        let wrong_blind = BytesN::from_array(&env, &[0xCCu8; 32]);
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back(VerifyRequest { ip_id: id, secret, blinding_factor: wrong_blind });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert!(!results.get(0).unwrap().valid);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_verify_nonexistent_ip_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back(VerifyRequest {
+            ip_id: 9999,
+            secret: BytesN::from_array(&env, &[0x01u8; 32]),
+            blinding_factor: BytesN::from_array(&env, &[0x02u8; 32]),
+        });
+        client.batch_verify_commitments(&requests);
+    }
+
+    // ── Issue #459: Hierarchical Storage Tests ────────────────────────────────
+
+    #[test]
+    fn test_assign_and_list_ip_by_category() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x10u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let category = BytesN::from_array(&env, &[0xCAu8; 32]);
+        client.assign_ip_to_category(&ip_id, &category);
+
+        let ids = client.list_ip_by_category(&owner, &category);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0).unwrap(), ip_id);
+    }
+
+    #[test]
+    fn test_list_owner_categories() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash1 = BytesN::from_array(&env, &[0x11u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0x12u8; 32]);
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let cat1 = BytesN::from_array(&env, &[0xC1u8; 32]);
+        let cat2 = BytesN::from_array(&env, &[0xC2u8; 32]);
+        client.assign_ip_to_category(&id1, &cat1);
+        client.assign_ip_to_category(&id2, &cat2);
+
+        let cats = client.list_owner_categories(&owner);
+        assert_eq!(cats.len(), 2);
+    }
+
+    #[test]
+    fn test_assign_ip_to_category_no_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x13u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        let category = BytesN::from_array(&env, &[0xC3u8; 32]);
+
+        client.assign_ip_to_category(&ip_id, &category);
+        client.assign_ip_to_category(&ip_id, &category); // duplicate call
+
+        let ids = client.list_ip_by_category(&owner, &category);
+        assert_eq!(ids.len(), 1); // still only one entry
+    }
+
+    #[test]
+    fn test_list_ip_by_category_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let category = BytesN::from_array(&env, &[0xC4u8; 32]);
+
+        let ids = client.list_ip_by_category(&owner, &category);
+        assert_eq!(ids.len(), 0);
     }
 }

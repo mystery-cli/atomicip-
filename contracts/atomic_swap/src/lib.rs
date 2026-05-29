@@ -4,6 +4,7 @@ mod swap;
 // mod upgrade;
 mod utils;
 mod multi_currency;
+mod price_oracle;
 mod types;
 
 use soroban_sdk::{
@@ -17,6 +18,10 @@ pub use types::*;
 mod validation;
 use validation::*;
 use multi_currency::{SupportedToken, MultiCurrencyConfig, TokenMetadata};
+use price_oracle::{
+    OracleConfig, OracleConfigSetEvent, OraclePriceUsedEvent,
+    fetch_oracle_price, load_oracle_config, store_oracle_config, validate_price_bounds,
+};
 
 // ── Error Codes ────────────────────────────────────────────────────────────
 
@@ -60,6 +65,11 @@ pub enum ContractError {
     AlreadySigned = 43,
     NotARequiredSigner = 44,
     RollbackWindowExpired = 45,
+    /// #470: Oracle errors
+    OracleNotConfigured = 46,
+    OraclePriceInvalid = 47,
+    OraclePriceBelowMin = 48,
+    OraclePriceAboveMax = 49,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -144,6 +154,8 @@ pub enum DataKey {
     SwapSignatures(u64),
     /// Maps swap_id → ledger timestamp when the swap reached Completed.
     CompletionTimestamp(u64),
+    /// #470: Price oracle configuration (oracle contract address + enabled flag).
+    OracleConfig,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -240,6 +252,88 @@ impl AtomicSwap {
         // backward compatibility against the v1 schema.
         // let schema = upgrade::build_v1_schema(&env);
         // upgrade::store_schema(&env, &schema);
+    }
+
+    // ── #470: Price Oracle ────────────────────────────────────────────────────
+
+    /// Admin sets (or updates) the price oracle contract address.
+    /// Pass `enabled = false` to disable oracle-based pricing without removing the address.
+    pub fn set_oracle(env: Env, caller: Address, oracle_address: Address, enabled: bool) {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotInitialized as u32,
+                ))
+            });
+        if caller != admin {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+        let config = OracleConfig {
+            oracle_address: oracle_address.clone(),
+            enabled,
+        };
+        store_oracle_config(&env, &config);
+        env.events().publish(
+            (symbol_short!("oracle"),),
+            OracleConfigSetEvent { oracle_address, enabled },
+        );
+    }
+
+    /// Returns the current oracle configuration, or `None` if not set.
+    pub fn get_oracle_config(env: Env) -> Option<OracleConfig> {
+        load_oracle_config(&env)
+    }
+
+    /// Fetches the current price for `token` from the configured oracle.
+    /// Useful for off-chain clients to preview the oracle price before initiating a swap.
+    pub fn get_oracle_price(env: Env, token: Address) -> i128 {
+        fetch_oracle_price(&env, &token)
+    }
+
+    /// Seller initiates a swap where the price is fetched from the oracle at call time.
+    /// `min_price` / `max_price` are optional slippage guards (0 = no bound).
+    /// Returns the swap ID.
+    pub fn initiate_swap_with_oracle_price(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        buyer: Address,
+        required_approvals: u32,
+        referrer: Option<Address>,
+        collateral_amount: i128,
+        insurance_enabled: bool,
+        min_price: i128,
+        max_price: i128,
+    ) -> u64 {
+        let oracle_price = fetch_oracle_price(&env, &token);
+        validate_price_bounds(&env, oracle_price, min_price, max_price);
+
+        let swap_id = Self::initiate_swap(
+            env.clone(),
+            token,
+            ip_id,
+            seller,
+            oracle_price,
+            buyer,
+            required_approvals,
+            referrer,
+            collateral_amount,
+            insurance_enabled,
+        );
+
+        env.events().publish(
+            (symbol_short!("ora_price"),),
+            OraclePriceUsedEvent { swap_id, oracle_price },
+        );
+
+        swap_id
     }
 
     /// Seller initiates a patent sale. Returns the swap ID.
@@ -360,11 +454,15 @@ impl AtomicSwap {
     }
 
     /// Evaluate all conditions on a swap. Panics with ConditionNotMet if any fail.
-    fn evaluate_conditions(env: &Env, swap: &SwapRecord) {
+    /// `check_key_valid` controls whether KeyValid is enforced (true at reveal_key time).
+    fn evaluate_conditions(env: &Env, swap: &SwapRecord, check_key_valid: bool) {
         for i in 0..swap.conditions.len() {
             let ok = match swap.conditions.get(i).unwrap() {
                 SwapCondition::KeyValid => {
-                    // KeyValid is enforced at reveal_key; always passes at accept time.
+                    // At reveal_key time (check_key_valid=true) the key has already been
+                    // verified by registry::verify_commitment, so this always passes.
+                    // At accept time (check_key_valid=false) this is deferred.
+                    let _ = check_key_valid;
                     true
                 }
                 SwapCondition::PriceBelow(threshold) => swap.price < threshold,
@@ -372,15 +470,60 @@ impl AtomicSwap {
             };
             if !ok {
                 env.panic_with_error(Error::from_contract_error(
-                    ContractError::NotExpired as u32,
+                    ContractError::ConditionNotMet as u32,
                 ));
             }
         }
     }
 
-    /// Buyer accepts the swap with conditions. Conditions are stored on the swap record
-    /// and evaluated immediately. If all pass, the swap proceeds to Accepted.
-        // accept_swap_conditional removed - conditions field not in SwapRecord
+    /// #468: Buyer accepts the swap with conditions. Conditions are stored on the swap
+    /// record and evaluated immediately (except KeyValid, which is deferred to reveal_key).
+    /// If all non-deferred conditions pass, the swap proceeds to Accepted.
+    pub fn accept_swap_conditional(env: Env, swap_id: u64, conditions: Vec<SwapCondition>) {
+        require_not_paused(&env);
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+
+        // #254: Ensure all required approvals have been collected.
+        if swap.required_approvals > 0 {
+            let approvals: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapApprovals(swap_id))
+                .unwrap_or(Vec::new(&env));
+            if (approvals.len() as u32) < swap.required_approvals {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NeedApprovals as u32,
+                ));
+            }
+        }
+
+        // Attach conditions to the swap record.
+        swap.conditions = conditions;
+
+        // Evaluate non-deferred conditions immediately.
+        Self::evaluate_conditions(&env, &swap, false);
+
+        // Transfer payment from buyer into contract escrow.
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &swap.price,
+        );
+
+        swap.accept_timestamp = env.ledger().timestamp();
+        swap.status = SwapStatus::Accepted;
+        swap::save_swap(&env, swap_id, &swap);
+
+        Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+        env.events().publish(
+            (symbol_short!("swap_acpt"),),
+            SwapAcceptedEvent { swap_id, buyer: swap.buyer },
+        );
+    }
 
     /// Buyer accepts the swap.
     pub fn accept_swap(env: Env, swap_id: u64) {
@@ -413,7 +556,7 @@ impl AtomicSwap {
 
         // #351: Evaluate any buyer-set conditions.
         if !swap.conditions.is_empty() {
-            Self::evaluate_conditions(&env, &swap);
+            Self::evaluate_conditions(&env, &swap, false);
         }
 
         // Check minimum reputation requirement set by seller
@@ -556,6 +699,14 @@ impl AtomicSwap {
                     .extend_ttl(&DataKey::InsuranceClaimable(swap_id), LEDGER_BUMP, LEDGER_BUMP);
             }
             env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
+        }
+
+        // #468: Enforce KeyValid condition — if the swap has a KeyValid condition,
+        // the key must have been verified above. Since we only reach here when valid=true,
+        // this is always satisfied; but we also re-evaluate all other conditions at
+        // reveal time to ensure time/price conditions still hold.
+        if !swap.conditions.is_empty() {
+            Self::evaluate_conditions(&env, &swap, true);
         }
 
         swap.status = SwapStatus::Completed;
@@ -2671,6 +2822,19 @@ impl AtomicSwap {
                 &swap.price,
             );
 
+            // #354: Collect insurance premium from buyer and add to pool.
+            if swap.insurance_enabled && swap.insurance_premium > 0 {
+                token_client.transfer(
+                    &swap.buyer,
+                    &env.current_contract_address(),
+                    &swap.insurance_premium,
+                );
+                let pool_key = DataKey::InsurancePool(swap.token.clone());
+                let pool: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
+                env.storage().persistent().set(&pool_key, &(pool + swap.insurance_premium));
+                env.storage().persistent().extend_ttl(&pool_key, LEDGER_BUMP, LEDGER_BUMP);
+            }
+
             swap.accept_timestamp = env.ledger().timestamp();
             swap.status = SwapStatus::Accepted;
             swap::save_swap(&env, swap_id, &swap);
@@ -2688,6 +2852,7 @@ impl AtomicSwap {
     }
 
     /// Batch reveal keys for multiple swaps. Seller-only.
+    /// #518: Emits BatchFeeBreakdownEvent with per-swap fee breakdown.
     pub fn batch_reveal_keys(
         env: Env,
         swap_ids: Vec<u64>,
@@ -2702,6 +2867,8 @@ impl AtomicSwap {
                 ContractError::InvalidKey as u32,
             ));
         }
+
+        let mut fee_breakdowns: Vec<SwapFeeBreakdown> = Vec::new(&env);
 
         for i in 0..swap_ids.len() {
             let swap_id = swap_ids.get(i).unwrap();
@@ -2744,7 +2911,19 @@ impl AtomicSwap {
                 0
             };
 
-            let seller_amount = swap.price - fee_amount;
+            // #518: Compute referral fee
+            let referral_amount = if let Some(ref _referrer) = swap.referrer {
+                let rbps = config.referral_fee_bps as i128;
+                if rbps > 0 && swap.price > 0 {
+                    (swap.price * rbps) / 10000
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            let seller_amount = swap.price - fee_amount - referral_amount;
             token_client.transfer(
                 &env.current_contract_address(),
                 &swap.seller,
@@ -2758,6 +2937,34 @@ impl AtomicSwap {
                     &fee_amount,
                 );
             }
+
+            // #518: Pay referral reward
+            if referral_amount > 0 {
+                if let Some(ref referrer) = swap.referrer {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        referrer,
+                        &referral_amount,
+                    );
+                    env.events().publish(
+                        (soroban_sdk::symbol_short!("ref_paid"),),
+                        ReferralPaidEvent {
+                            swap_id,
+                            referrer: referrer.clone(),
+                            referral_amount,
+                        },
+                    );
+                }
+            }
+
+            // #518: Collect fee breakdown
+            fee_breakdowns.push_back(SwapFeeBreakdown {
+                swap_id,
+                price: swap.price,
+                protocol_fee: fee_amount,
+                referral_fee: referral_amount,
+                seller_amount,
+            });
 
             // Release collateral
             if swap.collateral_amount > 0 {
@@ -2785,15 +2992,261 @@ impl AtomicSwap {
                     );
                 }
             }
+
+            // Update reputation on batch completion
+            Self::update_reputation(&env, &swap.seller, 5);
+            Self::update_reputation(&env, &swap.buyer, 5);
         }
 
         env.events().publish(
             (soroban_sdk::symbol_short!("btch_key"),),
             BatchKeysRevealedEvent {
-                swap_ids,
-                seller,
+                swap_ids: swap_ids.clone(),
+                seller: seller.clone(),
             },
         );
+
+        // #518: Emit fee breakdown event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_fee"),),
+            BatchFeeBreakdownEvent {
+                swap_ids,
+                seller,
+                fees: fee_breakdowns,
+            },
+        );
+    }
+
+    // ── #517: Batch Swap Cancellation ─────────────────────────────────────────
+
+    /// Cancel multiple pending swaps in a batch. Only the seller or buyer may cancel.
+    /// Each swap must be in Pending status. Tracks cancellation reasons for each swap.
+    /// Returns the list of swap IDs that were successfully cancelled.
+    pub fn batch_cancel_swaps(
+        env: Env,
+        swap_ids: Vec<u64>,
+        canceller: Address,
+        reasons: Vec<Bytes>,
+    ) -> Vec<u64> {
+        canceller.require_auth();
+
+        let len = swap_ids.len();
+        if reasons.len() != len {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidKey as u32,
+            ));
+        }
+
+        let mut cancelled_ids: Vec<u64> = Vec::new(&env);
+
+        for i in 0..len {
+            let swap_id = swap_ids.get(i).unwrap();
+            let reason = reasons.get(i).unwrap();
+
+            let mut swap = require_swap_exists(&env, swap_id);
+
+            require_seller_or_buyer(&env, &canceller, &swap);
+            require_swap_status(
+                &env,
+                &swap,
+                SwapStatus::Pending,
+                ContractError::OnlyPending,
+            );
+
+            swap.status = SwapStatus::Cancelled;
+            swap::save_swap(&env, swap_id, &swap);
+
+            // Release the IP lock
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveSwap(swap.ip_id));
+
+            // Store cancellation reason
+            env.storage()
+                .persistent()
+                .set(&DataKey::CancelReason(swap_id), &reason);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::CancelReason(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            // #253: Log history entry
+            Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+
+            // Update reputation: canceller loses 10 points
+            Self::update_reputation(&env, &canceller, -10);
+
+            cancelled_ids.push_back(swap_id);
+        }
+
+        // Emit batch cancellation event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_ccl"),),
+            BatchCancelledEvent {
+                swap_ids: cancelled_ids.clone(),
+                canceller,
+                reasons,
+            },
+        );
+
+        cancelled_ids
+    }
+
+    /// Seller initiates multiple patent sales with optional insurance. Returns a Vec of swap IDs.
+    /// When `insurance_enabled` is true, each swap's premium is set to 2% of its price and
+    /// collected from the buyer at `batch_accept_swaps` time.
+    pub fn batch_initiate_swap_with_insurance(
+        env: Env,
+        token: Address,
+        ip_ids: Vec<u64>,
+        seller: Address,
+        prices: Vec<i128>,
+        buyer: Address,
+        required_approvals: u32,
+        referrer: Option<Address>,
+        insurance_enabled: bool,
+    ) -> Vec<u64> {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        let len = ip_ids.len();
+        let mut swap_ids: Vec<u64> = Vec::new(&env);
+
+        for i in 0..len {
+            let ip_id = ip_ids.get(i).unwrap();
+            let price = prices.get(i).unwrap();
+
+            require_positive_price(&env, price);
+            registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+            require_no_active_swap(&env, ip_id);
+
+            let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+            let insurance_premium = if insurance_enabled { price * 2 / 100 } else { 0 };
+
+            let swap = SwapRecord {
+                ip_id,
+                seller: seller.clone(),
+                buyer: buyer.clone(),
+                price,
+                token: token.clone(),
+                status: SwapStatus::Pending,
+                expiry: env.ledger().timestamp() + 604800u64,
+                accept_timestamp: 0,
+                required_approvals,
+                dispute_timestamp: 0,
+                referrer: referrer.clone(),
+                collateral_amount: 0,
+                insurance_premium,
+                insurance_enabled,
+                escrow_agent: None,
+                quantity: 1,
+                conditions: Vec::new(&env),
+                paid_amount: 0,
+                is_installment: false,
+            };
+
+            if insurance_enabled {
+                env.storage().persistent().set(&DataKey::SwapInsurance(id), &insurance_premium);
+                env.storage().persistent().extend_ttl(&DataKey::SwapInsurance(id), LEDGER_BUMP, LEDGER_BUMP);
+            }
+
+            env.storage().persistent().set(&DataKey::Swap(id), &swap);
+            env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+            env.storage().persistent().set(&DataKey::ActiveSwap(ip_id), &id);
+            env.storage().persistent().extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+            let mut ip_swap_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::IpSwaps(ip_id))
+                .unwrap_or(Vec::new(&env));
+            ip_swap_ids.push_back(id);
+            env.storage().persistent().set(&DataKey::IpSwaps(ip_id), &ip_swap_ids);
+            env.storage().persistent().extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+
+            Self::append_history(&env, id, SwapStatus::Pending);
+            env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("swap_init"),),
+                SwapInitiatedEvent {
+                    swap_id: id,
+                    ip_id,
+                    seller: seller.clone(),
+                    buyer: buyer.clone(),
+                    price,
+                },
+            );
+
+            swap_ids.push_back(id);
+        }
+
+        swap_ids
+    }
+
+    /// Arbitrate multiple disputed swaps in one call. Arbitrator-only.
+    /// `refund` applies uniformly to all swaps in the batch.
+    pub fn batch_arbitrate_swaps(env: Env, swap_ids: Vec<u64>, arbitrator: Address, refund: bool) {
+        arbitrator.require_auth();
+
+        for swap_id in swap_ids.iter() {
+            let mut swap = require_swap_exists(&env, swap_id);
+            require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::NotDisputed);
+
+            let token_client = token::Client::new(&env, &swap.token);
+
+            if refund {
+                token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
+
+                if swap.collateral_amount > 0 {
+                    if let Some(collateral) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                    {
+                        token_client.transfer(&env.current_contract_address(), &swap.buyer, &collateral);
+                        env.storage().persistent().remove(&DataKey::SwapCollateral(swap_id));
+                    }
+                }
+
+                swap.status = SwapStatus::Cancelled;
+            } else {
+                let config = Self::protocol_config(&env);
+                let fee_amount = if config.protocol_fee_bps > 0 && swap.price > 0 {
+                    (swap.price * config.protocol_fee_bps as i128) / 10000
+                } else {
+                    0
+                };
+                let seller_amount = swap.price - fee_amount;
+                token_client.transfer(&env.current_contract_address(), &swap.seller, &seller_amount);
+                if fee_amount > 0 {
+                    token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
+                }
+
+                if swap.collateral_amount > 0 {
+                    if let Some(collateral) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                    {
+                        token_client.transfer(&env.current_contract_address(), &swap.seller, &collateral);
+                        env.storage().persistent().remove(&DataKey::SwapCollateral(swap_id));
+                    }
+                }
+
+                swap.status = SwapStatus::Completed;
+            }
+
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+            Self::append_history(&env, swap_id, swap.status.clone());
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("arb_dec"),),
+                ArbitratedEvent { swap_id, arbitrator: arbitrator.clone(), refunded: refund },
+            );
+        }
     }
 
     // ── #358: Swap Timeout Escalation ─────────────────────────────────────────
@@ -2963,6 +3416,50 @@ impl AtomicSwap {
         }
 
         swap_ids
+    }
+
+    /// Buyer deposits funds into multiple escrow-mode swaps in one call.
+    /// Each swap must be in `Pending` status with `SwapMode::Escrow`.
+    pub fn batch_escrow_deposit(env: Env, swap_ids: Vec<u64>, buyer: Address) {
+        buyer.require_auth();
+
+        for swap_id in swap_ids.iter() {
+            let mut swap = require_swap_exists(&env, swap_id);
+
+            if swap.buyer != buyer {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+
+            let mode: SwapMode = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapMode(swap_id))
+                .unwrap_or(SwapMode::Atomic);
+            if mode != SwapMode::Escrow {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+
+            require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+
+            token::Client::new(&env, &swap.token).transfer(
+                &swap.buyer,
+                &env.current_contract_address(),
+                &swap.price,
+            );
+
+            env.storage().persistent().set(&DataKey::EscrowDeposit(swap_id), &swap.price);
+            env.storage().persistent().extend_ttl(&DataKey::EscrowDeposit(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            swap.accept_timestamp = env.ledger().timestamp();
+            swap.status = SwapStatus::Accepted;
+            swap::save_swap(&env, swap_id, &swap);
+            Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("esc_dep"),),
+                SwapAcceptedEvent { swap_id, buyer: swap.buyer },
+            );
+        }
     }
 
     /// Buyer deposits funds into escrow. Moves swap to `Accepted`.
@@ -3322,6 +3819,9 @@ impl AtomicSwap {
 // mod upgrade_chaos_tests;
 
 #[cfg(test)]
+mod batch_swap_features_tests;
+
+#[cfg(test)]
 mod installment_tests {
     use super::*;
     use soroban_sdk::{testutils::Address as TestAddress, Env, Vec};
@@ -3489,3 +3989,276 @@ mod installment_tests {
     }
 }
 
+// ── #517 & #518: Batch cancellation and fee breakdown tests ─────────────
+
+#[cfg(test)]
+mod batch_enhancement_tests {
+    use super::*;
+    use soroban_sdk::{Address, Bytes, Env, Vec};
+
+    fn setup_swap(env: &Env, id: u64, seller: &Address, buyer: &Address, price: i128, token: &Address, status: SwapStatus) {
+        let swap = SwapRecord {
+            ip_id: id,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price,
+            token: token.clone(),
+            status,
+            expiry: 9_999_999,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            insurance_enabled: false,
+            escrow_agent: None,
+            quantity: 1,
+            conditions: Vec::new(env),
+            paid_amount: 0,
+            is_installment: false,
+        };
+        env.storage().persistent().set(&DataKey::Swap(id), &swap);
+        env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::ActiveSwap(swap.ip_id), &id);
+        env.storage().persistent().extend_ttl(&DataKey::ActiveSwap(swap.ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    // ── #517: Batch Cancellation Tests ───────────────────────────────────
+
+    #[test]
+    fn test_batch_cancel_swaps_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            setup_swap(&env, 1, &seller, &buyer, 100, &token, SwapStatus::Pending);
+            setup_swap(&env, 2, &seller, &buyer, 200, &token, SwapStatus::Pending);
+            setup_swap(&env, 3, &seller, &buyer, 300, &token, SwapStatus::Pending);
+        });
+
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [1, 2, 3]);
+        let reasons: Vec<Bytes> = Vec::from_array(&env, [
+            Bytes::from_slice(&env, b"no_longer_needed"),
+            Bytes::from_slice(&env, b"price_changed"),
+            Bytes::from_slice(&env, b"buyer_requested"),
+        ]);
+
+        let cancelled = client.batch_cancel_swaps(&swap_ids, &seller, &reasons);
+        assert_eq!(cancelled.len(), 3);
+
+        env.as_contract(&contract_id, || {
+            let reason1: Bytes = env.storage().persistent().get(&DataKey::CancelReason(1u64)).unwrap();
+            assert_eq!(reason1, Bytes::from_slice(&env, b"no_longer_needed"));
+            let reason2: Bytes = env.storage().persistent().get(&DataKey::CancelReason(2u64)).unwrap();
+            assert_eq!(reason2, Bytes::from_slice(&env, b"price_changed"));
+        });
+
+        let rec1 = client.get_swap(&1).unwrap();
+        assert_eq!(rec1.status, SwapStatus::Cancelled);
+        let rec2 = client.get_swap(&2).unwrap();
+        assert_eq!(rec2.status, SwapStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_batch_cancel_swaps_by_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            setup_swap(&env, 1, &seller, &buyer, 100, &token, SwapStatus::Pending);
+        });
+
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [1]);
+        let reasons: Vec<Bytes> = Vec::from_array(&env, [Bytes::from_slice(&env, b"buyer_cancel")]);
+        let cancelled = client.batch_cancel_swaps(&swap_ids, &buyer, &reasons);
+        assert_eq!(cancelled.len(), 1);
+        let rec = client.get_swap(&1).unwrap();
+        assert_eq!(rec.status, SwapStatus::Cancelled);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_cancel_swaps_mismatched_reasons() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            setup_swap(&env, 1, &seller, &buyer, 100, &token, SwapStatus::Pending);
+            setup_swap(&env, 2, &seller, &buyer, 200, &token, SwapStatus::Pending);
+        });
+
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [1, 2]);
+        let reasons: Vec<Bytes> = Vec::from_array(&env, [Bytes::from_slice(&env, b"reason")]);
+        client.batch_cancel_swaps(&swap_ids, &seller, &reasons);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_cancel_swaps_not_pending_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            setup_swap(&env, 1, &seller, &buyer, 100, &token, SwapStatus::Accepted);
+        });
+
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [1]);
+        let reasons: Vec<Bytes> = Vec::from_array(&env, [Bytes::from_slice(&env, b"cancel")]);
+        client.batch_cancel_swaps(&swap_ids, &seller, &reasons);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_cancel_swaps_unauthorized_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            setup_swap(&env, 1, &seller, &buyer, 100, &token, SwapStatus::Pending);
+        });
+
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [1]);
+        let reasons: Vec<Bytes> = Vec::from_array(&env, [Bytes::from_slice(&env, b"cancel")]);
+        client.batch_cancel_swaps(&swap_ids, &stranger, &reasons);
+    }
+
+    #[test]
+    fn test_batch_cancel_swaps_tracks_reasons_individually() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            setup_swap(&env, 10, &seller, &buyer, 1000, &token, SwapStatus::Pending);
+            setup_swap(&env, 20, &seller, &buyer, 2000, &token, SwapStatus::Pending);
+            setup_swap(&env, 30, &seller, &buyer, 3000, &token, SwapStatus::Pending);
+        });
+
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [10, 20, 30]);
+        let reasons: Vec<Bytes> = Vec::from_array(&env, [
+            Bytes::from_slice(&env, b"dup_ip"),
+            Bytes::from_slice(&env, b"buyer_credit"),
+            Bytes::from_slice(&env, b"price_disagreement"),
+        ]);
+
+        client.batch_cancel_swaps(&swap_ids, &seller, &reasons);
+
+        let r1 = client.get_cancellation_reason(&10).unwrap();
+        assert_eq!(r1, Bytes::from_slice(&env, b"dup_ip"));
+        let r2 = client.get_cancellation_reason(&20).unwrap();
+        assert_eq!(r2, Bytes::from_slice(&env, b"buyer_credit"));
+        let r3 = client.get_cancellation_reason(&30).unwrap();
+        assert_eq!(r3, Bytes::from_slice(&env, b"price_disagreement"));
+    }
+
+    // ── #518: Batch Fee Breakdown Tests ─────────────────────────────────
+
+    #[test]
+    fn test_swap_fee_breakdown_struct() {
+        let env = Env::default();
+        let breakdown = SwapFeeBreakdown {
+            swap_id: 42,
+            price: 1000,
+            protocol_fee: 25,
+            referral_fee: 10,
+            seller_amount: 965,
+        };
+        assert_eq!(breakdown.swap_id, 42);
+        assert_eq!(breakdown.price, 1000);
+        assert_eq!(breakdown.protocol_fee, 25);
+        assert_eq!(breakdown.referral_fee, 10);
+        assert_eq!(breakdown.seller_amount, 965);
+    }
+
+    #[test]
+    fn test_batch_fee_breakdown_event_struct() {
+        let env = Env::default();
+
+        let fee = SwapFeeBreakdown {
+            swap_id: 1,
+            price: 500,
+            protocol_fee: 12,
+            referral_fee: 5,
+            seller_amount: 483,
+        };
+
+        let fees: Vec<SwapFeeBreakdown> = Vec::from_array(&env, [fee]);
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [1]);
+        let seller = Address::generate(&env);
+
+        let event = BatchFeeBreakdownEvent {
+            swap_ids: swap_ids.clone(),
+            seller: seller.clone(),
+            fees: fees.clone(),
+        };
+
+        assert_eq!(event.swap_ids.len(), 1);
+        assert_eq!(event.swap_ids.get(0).unwrap(), 1);
+        assert_eq!(event.seller, seller);
+        assert_eq!(event.fees.len(), 1);
+        assert_eq!(event.fees.get(0).unwrap().swap_id, 1);
+        assert_eq!(event.fees.get(0).unwrap().price, 500);
+    }
+
+    #[test]
+    fn test_batch_cancelled_event_struct() {
+        let env = Env::default();
+
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [1, 2, 3]);
+        let canceller = Address::generate(&env);
+        let reasons: Vec<Bytes> = Vec::from_array(&env, [
+            Bytes::from_slice(&env, b"reason1"),
+            Bytes::from_slice(&env, b"reason2"),
+            Bytes::from_slice(&env, b"reason3"),
+        ]);
+
+        let event = BatchCancelledEvent {
+            swap_ids: swap_ids.clone(),
+            canceller: canceller.clone(),
+            reasons: reasons.clone(),
+        };
+
+        assert_eq!(event.swap_ids.len(), 3);
+        assert_eq!(event.canceller, canceller);
+        assert_eq!(event.reasons.len(), 3);
+        assert_eq!(event.reasons.get(0).unwrap(), Bytes::from_slice(&env, b"reason1"));
+        assert_eq!(event.reasons.get(2).unwrap(), Bytes::from_slice(&env, b"reason3"));
+    }
+}
