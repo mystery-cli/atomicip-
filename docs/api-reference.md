@@ -128,6 +128,135 @@ let ip_ids = registry.batch_commit_ip(&owner, &hashes);
 
 ---
 
+## `batch_commit_ip_anonymous`
+
+Commit multiple IP hashes anonymously in a single transaction. The contract stores a blinded owner identifier alongside each commitment; the on-chain `owner` field is set to the contract address to avoid exposing the submitter.
+
+### Signature
+
+```rust
+pub fn batch_commit_ip_anonymous(
+    env: Env,
+    blinded_owner: BytesN<32>,
+    commitment_hashes: Vec<BytesN<32>>,
+) -> Vec<u64>
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `env` | `Env` | Soroban environment |
+| `blinded_owner` | `BytesN<32>` | Off-chain blinded owner identifier (e.g. `sha256(owner \|\| nonce)`). Stored per commitment for later ownership proof. |
+| `commitment_hashes` | `Vec<BytesN<32>>` | Non-empty vector of commitment hashes to register anonymously. |
+
+### Returns
+
+`Vec<u64>` — Assigned sequential IP IDs in the same order as the input hashes.
+
+### Panics
+
+| Error | Code | Condition |
+|---|---|---|
+| `ZeroCommitmentHash` | 2 | `commitment_hashes` is empty, or any hash is all zeros |
+| `CommitmentAlreadyRegistered` | 3 | Any hash is already registered (including duplicates within the same batch) |
+
+### Auth Model
+
+No caller authorization is required. The submitter's identity is intentionally not recorded on-chain.
+
+### Events
+
+One event is emitted per commitment hash:
+
+- **Topics:** `(symbol_short!("ip_commit_anon"), contract_address)`
+- **Data:** `(ip_id: u64, timestamp: u64, blinded_owner: BytesN<32>)`
+
+### Storage
+
+Per commitment hash, two persistent storage keys are written:
+
+| Key | Value | Purpose |
+|---|---|---|
+| `CommitmentOwner(hash)` | contract address | Global duplicate guard |
+| `AnonymousOwner(hash)` | `blinded_owner` | Ownership proof pointer |
+
+Anonymous commits do **not** populate `OwnerIps` — they will not appear in `list_ip_by_owner` for any address.
+
+### Example (Rust SDK)
+
+```rust
+// Construct blinded owner: sha256(real_owner_bytes || random_nonce)
+let mut preimage = Bytes::new(&env);
+preimage.append(&owner_bytes);
+preimage.append(&nonce_bytes);
+let blinded_owner: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+let hashes = Vec::from_array(&env, [hash1, hash2]);
+let ip_ids = registry.batch_commit_ip_anonymous(&blinded_owner, &hashes);
+// ip_ids = [1, 2]
+```
+
+### Example (REST API)
+
+**POST** `/ip/batch/anonymous`
+
+**Request Body:**
+```json
+{
+  "blinded_owner": "a1b2c3d4...",
+  "commitment_hashes": [
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+  ]
+}
+```
+
+**Response (200 OK):**
+```json
+[1, 2]
+```
+
+---
+
+## `get_anonymous_owner`
+
+Retrieve the blinded owner identifier stored for an anonymous commitment.
+
+### Signature
+
+```rust
+pub fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>>
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `env` | `Env` | Soroban environment |
+| `commitment_hash` | `BytesN<32>` | The commitment hash to look up |
+
+### Returns
+
+`Option<BytesN<32>>` — The blinded owner identifier if the hash was registered via `batch_commit_ip_anonymous`, or `None` if no anonymous owner record exists (e.g. the hash was committed via `commit_ip`).
+
+### Panics
+
+This function does not panic.
+
+### Example (Rust SDK)
+
+```rust
+let blinded = registry.get_anonymous_owner(&commitment_hash);
+match blinded {
+    Some(b) => println!("Blinded owner: {:?}", b),
+    None => println!("Not an anonymous commitment"),
+}
+```
+
+---
+
+
 ## `get_ip`
 
 Retrieve an IP record by ID.
@@ -510,3 +639,183 @@ See [TTL_MANAGEMENT.md](../TTL_MANAGEMENT.md) for details.
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid commitment hashes
 - [Atomic Swap Flow](atomic-swap.md) — How to sell IP using atomic swaps
 - [Security Considerations](security.md) — Best practices for secret management
+
+---
+
+## Tiered Access Control
+
+IP owners can grant other addresses tiered read/verify/transfer access without transferring ownership.
+
+### Access Tiers
+
+| Level | Name | Permissions |
+|---|---|---|
+| `1` | **view** | Read IP metadata |
+| `2` | **verify** | View + verify the commitment |
+| `3` | **transfer** | View + verify + initiate transfer |
+
+Tiers are hierarchical: a grantee with level 3 satisfies checks for levels 1 and 2. The owner always has full access (level 3) regardless of grants.
+
+---
+
+### `grant_ip_access`
+
+Grant tiered access to an IP for a third party. Owner-only. Granting to an address that already has a grant updates the level.
+
+```rust
+pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP to grant access to |
+| `grantee` | `Address` | The address receiving access |
+| `access_level` | `u32` | `1` = view, `2` = verify, `3` = transfer |
+
+**Panics:** `Unauthorized` (6) if `access_level` is 0 or > 3, or caller is not the owner.
+
+**Event:** `(symbol_short!("ac_grant"), ip_id)` → `(grantee, access_level)`
+
+```rust
+// Grant verify access to a partner
+registry.grant_ip_access(&ip_id, &partner, &2u32);
+```
+
+---
+
+### `revoke_ip_access`
+
+Revoke access from a grantee. Owner-only. No-op if the grantee has no grant.
+
+```rust
+pub fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address)
+```
+
+**Event:** `(symbol_short!("ac_revoke"), ip_id)` → `grantee`
+
+```rust
+registry.revoke_ip_access(&ip_id, &partner);
+```
+
+---
+
+### `check_ip_access`
+
+Check whether an address has at least the required access level for an IP.
+
+```rust
+pub fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool
+```
+
+Returns `true` if the grantee's level ≥ `required_level`, or if `grantee` is the owner.
+
+```rust
+if registry.check_ip_access(&ip_id, &caller, &2u32) {
+    // caller can verify the commitment
+}
+```
+
+---
+
+### `get_ip_access_grants`
+
+Return all active access grants for an IP.
+
+```rust
+pub fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<IpAccessGrant>
+```
+
+Returns a `Vec<IpAccessGrant>` where each entry has `grantee: Address` and `access_level: u32`.
+
+---
+
+## Issue #458 — Batch Verification with ZK Proofs
+
+### `batch_verify_commitments`
+
+Verify multiple IP commitments in a single call. Each request recomputes `sha256(secret || blinding_factor)` and checks it against the stored commitment hash — the same zero-knowledge proof used by `verify_commitment`.
+
+```rust
+pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult>
+```
+
+#### `VerifyRequest`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP ID to verify |
+| `secret` | `BytesN<32>` | The secret used when committing |
+| `blinding_factor` | `BytesN<32>` | The blinding factor used when committing |
+
+#### `VerifyResult`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP ID that was verified |
+| `valid` | `bool` | `true` if the proof is correct |
+
+#### Panics
+
+Panics with `IpNotFound` (code 1) if any `ip_id` does not exist.
+
+#### Example
+
+```rust
+let requests = vec![
+    VerifyRequest { ip_id: 1, secret: s1, blinding_factor: b1 },
+    VerifyRequest { ip_id: 2, secret: s2, blinding_factor: b2 },
+];
+let results = client.batch_verify_commitments(&requests);
+// results[0].valid == true/false
+```
+
+---
+
+## Issue #459 — Hierarchical Storage for Commitments
+
+Organises IP commitments in a two-level hierarchy: `owner → category → ip_ids`. This enables O(1) category-scoped lookups without scanning the full owner index.
+
+### `assign_ip_to_category`
+
+Assign an IP to a category within the owner's hierarchy. Only the IP owner may call this.
+
+```rust
+pub fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP to categorise |
+| `category_hash` | `BytesN<32>` | 32-byte hash identifying the category (e.g. `sha256(label)`) |
+
+Panics with `IpNotFound` if the IP does not exist, or auth error if caller is not the owner. Duplicate assignments are silently ignored.
+
+### `list_ip_by_category`
+
+List all IP IDs for an owner within a specific category.
+
+```rust
+pub fn list_ip_by_category(env: Env, owner: Address, category_hash: BytesN<32>) -> Vec<u64>
+```
+
+Returns an empty vector if the owner has no IPs in that category.
+
+### `list_owner_categories`
+
+List all category hashes registered for an owner.
+
+```rust
+pub fn list_owner_categories(env: Env, owner: Address) -> Vec<BytesN<32>>
+```
+
+Returns an empty vector if the owner has no categories.
+
+#### Example
+
+```rust
+let category = env.crypto().sha256(&Bytes::from_slice(&env, b"patents"));
+client.assign_ip_to_category(&ip_id, &category);
+
+let ids = client.list_ip_by_category(&owner, &category);
+let cats = client.list_owner_categories(&owner);
+```

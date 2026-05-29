@@ -215,6 +215,55 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 
 ---
 
+## Batch Operations
+
+### #517: Batch Swap Cancellation
+
+Cancel multiple pending swaps in a single transaction with per-swap reason tracking.
+
+```rust
+let swap_ids = vec![1, 2, 3];
+let reasons = vec![
+    Bytes::from_slice(&env, b"no_longer_needed"),
+    Bytes::from_slice(&env, b"price_changed"),
+    Bytes::from_slice(&env, b"buyer_requested"),
+];
+let cancelled_ids = atomic_swap.batch_cancel_swaps(swap_ids, canceller, reasons);
+```
+
+**Constraints:**
+- `reasons.len()` must equal `swap_ids.len()` or the call panics with `InvalidKey`
+- Each swap must be in `Pending` state
+- The caller must be either the seller or buyer of each swap
+- Each swap receives its own `CancelReason` stored on-chain (retrievable via `get_cancellation_reason`)
+- The canceller's reputation is decreased by 10 points
+- A `BatchCancelledEvent` is emitted with `swap_ids`, `canceller`, and `reasons`
+
+**Returns:** A `Vec<u64>` of the successfully cancelled swap IDs.
+
+### #518: Batch Fee Breakdown
+
+When batch-revealing keys via `batch_reveal_keys`, the contract now emits a `BatchFeeBreakdownEvent` alongside the standard `BatchKeysRevealedEvent`. This event contains per-swap fee details:
+
+```rust
+pub struct SwapFeeBreakdown {
+    pub swap_id: u64,
+    pub price: i128,
+    pub protocol_fee: i128,
+    pub referral_fee: i128,
+    pub seller_amount: i128,
+}
+```
+
+The `BatchFeeBreakdownEvent` includes:
+- `swap_ids`: The list of swap IDs
+- `seller`: The seller's address
+- `fees`: A `Vec<SwapFeeBreakdown>` with fee details for each swap
+
+This allows off-chain indexers and frontends to display exact fee amounts per swap without replaying protocol fee logic.
+
+---
+
 ## Related Documentation
 
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid secrets
