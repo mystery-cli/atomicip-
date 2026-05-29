@@ -215,6 +215,55 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 
 ---
 
+## Batch Operations
+
+### #517: Batch Swap Cancellation
+
+Cancel multiple pending swaps in a single transaction with per-swap reason tracking.
+
+```rust
+let swap_ids = vec![1, 2, 3];
+let reasons = vec![
+    Bytes::from_slice(&env, b"no_longer_needed"),
+    Bytes::from_slice(&env, b"price_changed"),
+    Bytes::from_slice(&env, b"buyer_requested"),
+];
+let cancelled_ids = atomic_swap.batch_cancel_swaps(swap_ids, canceller, reasons);
+```
+
+**Constraints:**
+- `reasons.len()` must equal `swap_ids.len()` or the call panics with `InvalidKey`
+- Each swap must be in `Pending` state
+- The caller must be either the seller or buyer of each swap
+- Each swap receives its own `CancelReason` stored on-chain (retrievable via `get_cancellation_reason`)
+- The canceller's reputation is decreased by 10 points
+- A `BatchCancelledEvent` is emitted with `swap_ids`, `canceller`, and `reasons`
+
+**Returns:** A `Vec<u64>` of the successfully cancelled swap IDs.
+
+### #518: Batch Fee Breakdown
+
+When batch-revealing keys via `batch_reveal_keys`, the contract now emits a `BatchFeeBreakdownEvent` alongside the standard `BatchKeysRevealedEvent`. This event contains per-swap fee details:
+
+```rust
+pub struct SwapFeeBreakdown {
+    pub swap_id: u64,
+    pub price: i128,
+    pub protocol_fee: i128,
+    pub referral_fee: i128,
+    pub seller_amount: i128,
+}
+```
+
+The `BatchFeeBreakdownEvent` includes:
+- `swap_ids`: The list of swap IDs
+- `seller`: The seller's address
+- `fees`: A `Vec<SwapFeeBreakdown>` with fee details for each swap
+
+This allows off-chain indexers and frontends to display exact fee amounts per swap without replaying protocol fee logic.
+
+---
+
 ## Related Documentation
 
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid secrets
@@ -223,79 +272,110 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 
 ---
 
-## Price Oracle Integration (#470)
+## Batch Operations (#469)
 
-The atomic swap contract supports dynamic pricing via an on-chain price oracle.
+Batch functions allow a seller or buyer to initiate, accept, or complete multiple swaps in a single transaction, reducing fees and round-trips.
 
-### Overview
+### batch_initiate_swap
 
-Instead of the seller specifying a fixed price at initiation time, the price can be fetched from a trusted oracle contract at the moment the swap is created. This enables:
-
-- Market-rate pricing for IP assets
-- Automatic price discovery without off-chain coordination
-- Slippage protection via min/max price bounds
-
-### Oracle Interface
-
-The oracle contract must expose a single function:
+Seller initiates multiple patent sales at once. All swaps share the same buyer and payment token.
 
 ```rust
-fn get_price(token: Address) -> i128
-```
-
-Returns the current price in stroops (1 XLM = 10^7 stroops) for the given payment token.
-
-### Admin Setup
-
-The contract admin sets the oracle address once:
-
-```rust
-atomic_swap.set_oracle(
-    admin,          // must be the contract admin
-    oracle_address, // address of the oracle contract
-    true,           // enabled
+let swap_ids: Vec<u64> = swap_contract.batch_initiate_swap(
+    token,       // Payment token (same for all swaps)
+    ip_ids,      // Vec of IP IDs to sell
+    seller,      // Seller address (requires auth)
+    prices,      // Vec of prices — prices[i] corresponds to ip_ids[i]
+    buyer,       // Buyer address
+    0,           // required_approvals (0 = none)
+    None,        // referrer
 );
 ```
 
-### Oracle-Priced Swap
+**Constraints:**
+- `ip_ids.len() == prices.len()`
+- Seller must own every IP in `ip_ids`
+- No active swap may exist for any of the IPs
+- All prices must be > 0
+
+**Result:** Returns a `Vec<u64>` of the newly created swap IDs, one per IP.
+
+---
+
+### batch_accept_swaps
+
+Buyer accepts multiple Pending swaps in one call. Payment for each swap is transferred to the contract.
 
 ```rust
-let swap_id = atomic_swap.initiate_swap_with_oracle_price(
-    token,              // payment token
-    ip_id,              // IP to sell
-    seller,             // seller address (requires auth)
-    buyer,              // buyer address
-    0,                  // required_approvals
-    None,               // referrer
-    0,                  // collateral_amount
-    false,              // insurance_enabled
-    100_000_000,        // min_price: reject if oracle < 10 XLM
-    500_000_000,        // max_price: reject if oracle > 50 XLM (0 = no bound)
+swap_contract.batch_accept_swaps(
+    swap_ids,  // Vec of swap IDs to accept
+    buyer,     // Buyer address (requires auth)
 );
 ```
 
-The price used in the swap is the oracle price at call time. If the oracle price falls outside `[min_price, max_price]`, the call panics and no swap is created.
+**Constraints:**
+- Every swap must be in `Pending` state
+- `buyer` must match the `buyer` field on each swap
+- Required approvals (if any) must already be collected
 
-### Query Oracle Price
+**Result:** All swaps move to `Accepted`. A single `BatchAccepted` event is emitted.
 
-Off-chain clients can preview the current oracle price before initiating:
+---
+
+### batch_reveal_keys
+
+Seller reveals decryption keys for multiple Accepted swaps in one call. Each key is verified; payment is released per swap.
 
 ```rust
-let price = atomic_swap.get_oracle_price(token);
+swap_contract.batch_reveal_keys(
+    swap_ids,         // Vec of swap IDs
+    secrets,          // Vec of secrets — secrets[i] for swap_ids[i]
+    blinding_factors, // Vec of blinding factors
+    seller,           // Seller address (requires auth)
+);
 ```
 
-### Error Codes
+**Constraints:**
+- `swap_ids`, `secrets`, and `blinding_factors` must all have the same length
+- Every swap must be in `Accepted` state
+- Seller must be the initiator of every swap
+- Every `verify_commitment(ip_id, secret, blinding_factor)` must return `true`
 
-| Code | Name | Description |
-|------|------|-------------|
-| 46 | `OracleNotConfigured` | No oracle set, or oracle is disabled |
-| 47 | `OraclePriceInvalid` | Oracle returned a price ≤ 0 |
-| 48 | `OraclePriceBelowMin` | Oracle price is below the caller's `min_price` bound |
-| 49 | `OraclePriceAboveMax` | Oracle price is above the caller's `max_price` bound |
+**Result:** All swaps move to `Completed`. Protocol fees are deducted per swap. A single `BatchKeysRevealed` event is emitted.
+
+---
+
+### Batch Flow Example
+
+```rust
+// 1. Seller lists three IPs for sale in one transaction
+let swap_ids = swap_contract.batch_initiate_swap(
+    xlm_token,
+    vec![ip_id_1, ip_id_2, ip_id_3],
+    seller,
+    vec![100_000_000, 200_000_000, 50_000_000],
+    buyer,
+    0,
+    None,
+);
+
+// 2. Buyer accepts all three (sends total payment in one call)
+swap_contract.batch_accept_swaps(swap_ids.clone(), buyer);
+
+// 3. Seller reveals all three keys (completes all swaps in one call)
+swap_contract.batch_reveal_keys(
+    swap_ids,
+    vec![secret_1, secret_2, secret_3],
+    vec![blinding_1, blinding_2, blinding_3],
+    seller,
+);
+```
 
 ### Events
 
-| Topic | Payload | When |
-|-------|---------|------|
-| `oracle` | `OracleConfigSetEvent { oracle_address, enabled }` | Admin calls `set_oracle` |
-| `ora_price` | `OraclePriceUsedEvent { swap_id, oracle_price }` | Oracle-priced swap initiated |
+| Event | Symbol | Emitted by |
+|---|---|---|
+| `BatchAcceptedEvent` | `btch_acp` | `batch_accept_swaps` |
+| `BatchKeysRevealedEvent` | `btch_key` | `batch_reveal_keys` |
+
+Individual `SwapInitiatedEvent` events are still emitted per swap inside `batch_initiate_swap`.

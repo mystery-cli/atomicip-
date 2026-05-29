@@ -346,6 +346,35 @@ pub struct BatchKeysRevealedEvent {
     pub seller: Address,
 }
 
+/// #517: Payload published when a batch of swaps is cancelled.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchCancelledEvent {
+    pub swap_ids: Vec<u64>,
+    pub canceller: Address,
+    pub reasons: soroban_sdk::Vec<soroban_sdk::Bytes>,
+}
+
+/// #518: Per-swap fee breakdown entry for batch reveals.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapFeeBreakdown {
+    pub swap_id: u64,
+    pub price: i128,
+    pub protocol_fee: i128,
+    pub referral_fee: i128,
+    pub seller_amount: i128,
+}
+
+/// #518: Payload published when batch keys are revealed with fee breakdown.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchFeeBreakdownEvent {
+    pub swap_ids: Vec<u64>,
+    pub seller: Address,
+    pub fees: soroban_sdk::Vec<SwapFeeBreakdown>,
+}
+
 // ── #358: Timeout Escalation Event ────────────────────────────────────────────
 
 #[contracttype]
