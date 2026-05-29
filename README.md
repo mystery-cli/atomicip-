@@ -128,6 +128,10 @@ commit_ip(owner, commitment_hash) -> u64          // Timestamp a new IP commitme
 get_ip(ip_id) -> IpRecord                         // Retrieve an IP record
 verify_commitment(ip_id, secret) -> bool          // Verify a commitment against a secret
 list_ip_by_owner(owner) -> Vec<u64>               // List all IP IDs for an owner
+batch_verify_commitments(requests) -> Vec<VerifyResult>  // #458: Verify multiple commitments with ZK proofs
+assign_ip_to_category(ip_id, category_hash)       // #459: Assign IP to a hierarchical category
+list_ip_by_category(owner, category_hash) -> Vec<u64>    // #459: List IPs in a category
+list_owner_categories(owner) -> Vec<BytesN<32>>   // #459: List all categories for an owner
 ```
 
 ### Atomic Swap
@@ -137,6 +141,12 @@ initiate_swap(ip_id, price, buyer) -> u64         // Seller initiates a patent s
 accept_swap(swap_id, payment)                     // Buyer accepts and sends payment
 reveal_key(swap_id, decryption_key)               // Seller reveals key; payment releases
 cancel_swap(swap_id)                              // Cancel if key is invalid or timeout
+
+// #470: Price Oracle Integration
+set_oracle(caller, oracle_address, enabled)       // Admin sets the price oracle contract
+get_oracle_config() -> Option<OracleConfig>       // Query current oracle configuration
+get_oracle_price(token) -> i128                   // Fetch current price from oracle
+initiate_swap_with_oracle_price(...)  -> u64      // Initiate swap at oracle-determined price
 ```
 
 ## 🧪 Testing

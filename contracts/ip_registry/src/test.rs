@@ -40,6 +40,17 @@ mod tests {
         fn renew_ip(env: Env, ip_id: u64);
         fn get_renewal_count(env: Env, ip_id: u64) -> u32;
         fn delegate_commitment_authority(env: Env, root_owner: Address, delegator: Address, delegate_address: Address);
+        fn initiate_dispute(env: Env, ip_id: u64, challenger: Address, evidence_hash: BytesN<32>) -> u64;
+        fn submit_dispute_evidence(env: Env, dispute_id: u64, submitter: Address, evidence_hash: BytesN<32>);
+        fn resolve_dispute(env: Env, dispute_id: u64, winner: Address);
+        fn get_dispute(env: Env, dispute_id: u64) -> crate::DisputeRecord;
+        fn set_batch_metadata(env: Env, ip_id: u64, batch_id: BytesN<32>, description: soroban_sdk::Bytes);
+        fn get_batch_metadata(env: Env, ip_id: u64) -> Option<crate::BatchMetadata>;
+        fn get_commitment_compression(env: Env, ip_id: u64) -> crate::CompressionAlgo;
+        fn set_commitment_compression(env: Env, ip_id: u64, algorithm: crate::CompressionAlgo);
+        fn get_compressed_bytes(env: Env, ip_id: u64) -> soroban_sdk::Bytes;
+        fn encrypt_commitment(env: Env, ip_id: u64, encrypted_hash: soroban_sdk::Bytes, key_hint: BytesN<32>);
+        fn get_encrypted_commitment(env: Env, ip_id: u64) -> Option<crate::EncryptedCommitmentRecord>;
         fn revoke_delegation(env: Env, owner: Address, delegate_address: Address);
         fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool;
         fn commit_ip_delegated(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;
@@ -915,14 +926,22 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        // 32 unique bytes → entropy_score = 50
-        // pow_difficulty = 32 → pow_score = 50
-        // total = 100
-        let hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        // Use a hash with 29 unique bytes and 32 leading zero bits.
+        // entropy_score = (29 * 50) / 32 = 45
+        // pow_score = (32 * 50) / 32 = 50
+        // total = 95
+        let mut hash_bytes = [0u8; 32];
+        for i in 0..32 {
+            hash_bytes[i] = i as u8;
+        }
+        hash_bytes[0] = 0;
+        hash_bytes[1] = 0;
+        hash_bytes[2] = 0;
+        hash_bytes[3] = 0;
         let hash = BytesN::from_array(&env, &hash_bytes);
         let ip_id = client.commit_ip(&owner, &hash, &32u32);
         let strength = client.get_ip_strength(&ip_id);
-        assert_eq!(strength, 100u32);
+        assert_eq!(strength, 95u32);
     }
 
     #[test]
@@ -933,12 +952,22 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        // 32 unique bytes (50) + pow_difficulty=64 → pow_score capped at 50 → total = 100
-        let hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        // A hash that satisfies the PoW requirement can still score below 100.
+        // With 25 unique bytes and 64 leading zero bits:
+        // entropy_score = (25 * 50) / 32 = 39
+        // pow_score = 50
+        // total = 89
+        let mut hash_bytes = [0u8; 32];
+        for i in 0..32 {
+            hash_bytes[i] = i as u8;
+        }
+        for i in 0..8 {
+            hash_bytes[i] = 0;
+        }
         let hash = BytesN::from_array(&env, &hash_bytes);
         let ip_id = client.commit_ip(&owner, &hash, &64u32);
         let strength = client.get_ip_strength(&ip_id);
-        assert_eq!(strength, 100u32);
+        assert_eq!(strength, 89u32);
     }
 
     #[test]
@@ -949,10 +978,16 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        // 16 unique bytes → entropy_score = (16*50)/32 = 25
-        // pow_difficulty = 16 → pow_score = (16*50)/32 = 25
+        // A hash with 16 unique bytes and 16 leading zero bits gives:
+        // entropy_score = (16 * 50) / 32 = 25
+        // pow_score = (16 * 50) / 32 = 25
         // total = 50
-        let hash_bytes: [u8; 32] = core::array::from_fn(|i| (i % 16) as u8);
+        let mut hash_bytes = [0u8; 32];
+        for i in 0..32 {
+            hash_bytes[i] = (i % 16) as u8;
+        }
+        hash_bytes[0] = 0;
+        hash_bytes[1] = 0;
         let hash = BytesN::from_array(&env, &hash_bytes);
         let ip_id = client.commit_ip(&owner, &hash, &16u32);
         let strength = client.get_ip_strength(&ip_id);
@@ -972,7 +1007,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let delegate = <Address as TestAddress>::generate(&env);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
 
         let is_delegate = client.is_delegate(&owner, &delegate);
         assert!(is_delegate);
@@ -989,7 +1024,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let delegate = <Address as TestAddress>::generate(&env);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
         assert!(client.is_delegate(&owner, &delegate));
 
         client.revoke_delegation(&owner, &delegate);
@@ -1008,7 +1043,7 @@ mod tests {
         let delegate = <Address as TestAddress>::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
         let ip_id = client.commit_ip_delegated(&owner, &hash, &0u32);
 
         let record = client.get_ip(&ip_id);
@@ -1363,7 +1398,7 @@ mod tests {
     // ── Tests for Issue #428: Commitment Timestamp Notarization (continued) ──
 
     #[test]
-    fn test_notarize_ip_timestamp_with_valid_signature() {
+    fn test_notarize_ip_timestamp_with_valid_signature_continued() {
         use ed25519_dalek::{Signer, SigningKey};
 
         let env = Env::default();
@@ -2025,7 +2060,7 @@ mod tests {
         assert_eq!(client.get_anonymous_owner(&h), None);
     }
 
-    /// Each commitment emits an "ip_commit_anon" event with (id, timestamp, blinded_owner).
+    /// Each commitment emits an "ip_commit_a" event with (id, timestamp, blinded_owner).
     #[test]
     fn test_anon_batch_emits_event_per_commitment() {
         let env = Env::default();
@@ -2041,16 +2076,18 @@ mod tests {
         );
 
         let all_events = env.events().all();
-        // Exactly two ip_commit_anon events (one per hash).
+        // Exactly two ip_commit_a events (one per hash).
         let anon_events: soroban_sdk::Vec<_> = {
             let mut v = soroban_sdk::Vec::new(&env);
             for e in all_events.iter() {
-                let (_, topics, _) = e;
+                let topic = e.0.clone();
+                let topics = e.1.clone();
+                let data = e.2.clone();
                 if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
                     if let Some(first) = t.get(0) {
                         if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &first) {
-                            if s == symbol_short!("ip_commit_anon") {
-                                v.push_back(e);
+                            if s == symbol_short!("ip_cmt_a") {
+                                v.push_back((topic, topics, data));
                             }
                         }
                     }
